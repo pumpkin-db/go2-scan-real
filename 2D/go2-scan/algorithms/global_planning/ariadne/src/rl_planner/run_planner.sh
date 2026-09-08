@@ -1,0 +1,25 @@
+#!/bin/bash
+# rl_planner 启动包装（roslaunch type 入口）。
+# 绕开两个已核实的环境坑（详见 third_party.md）：
+#  1) conda activate 在本机会段错误 → 直接用 env 的绝对路径 python
+#  2) 系统 python3.8 无 torch、conda base 是 3.13 进不了 ROS noetic(py3.8 ABI)
+#     → 用 ariadne env（py3.8 + torch 2.3.1+cpu，机器上唯一非 base env）
+# PYTHONPATH 只挂 ROS 自带 dist-packages；严禁挂 /usr/lib/python3/dist-packages
+# （numpy 版本与 conda env 冲突的 ABI 坑）。
+export PYTHONPATH="/opt/ros/noetic/lib/python3/dist-packages:${PYTHONPATH}"
+# Timer 线程异常只上 stderr 且缓冲，线程死掉后日志无痕——必须 UNBUFFERED 才能看到
+export PYTHONUNBUFFERED=1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GO2_ROOT="${GO2_ROOT:-$(cd "$SCRIPT_DIR/../../../../../../.." && pwd)}"
+ARIADNE_PYTHON="${ARIADNE_PYTHON:-$GO2_ROOT/.venv/ariadne/bin/python}"
+[ -x "$ARIADNE_PYTHON" ] || {
+  echo "[ARIADNE] missing self-contained Python environment: $ARIADNE_PYTHON" >&2
+  echo "[ARIADNE] run $GO2_ROOT/setup_nx.sh first" >&2
+  exit 42
+}
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$GO2_ROOT/.cache/matplotlib}"
+mkdir -p "$MPLCONFIGDIR"
+# "$@" 必须透传：roslaunch 把 remap（如 /state_estimation:=/quad_0/body_pose）和
+# __name 放在 argv 里，丢了它们节点会订阅字面量话题、launch 私有参数全部落空
+# （2026-08-24 redo_run1 教训：节点卡死在等图循环、参数全走代码默认值）
+exec "$ARIADNE_PYTHON" "$SCRIPT_DIR/scripts/rl_planner.py" "$@"

@@ -1,0 +1,134 @@
+<launch>
+  <!-- ============================================================ -->
+  <!-- ARiADNE 建图+决策链（对齐官方契约版，2026-08-24 推倒重来）      -->
+  <!--   官方参考：new_algorithm/ARiADNE-ROS-Planner/src/launch/     -->
+  <!--             rl_planner.launch（本机 CMU env 曾以此完整跑通）    -->
+  <!--                                                              -->
+  <!-- 与上一次失败版的差异（根因见 third_party.md「A2 失败解剖」）：    -->
+  <!--   1. map→world 恒等静态 TF：官方环境有真 map 帧（LIO 发布），    -->
+  <!--      我们的里程计即世界坐标、无 map 帧。上次 octomap frame_id=map -->
+  <!--      导致 RViz 里 projected_map 悬空错位。数值恒等，桥接即可。    -->
+  <!--   2. sensorScanGeneration 的 state_estimation 输入接雷达位姿     -->
+  <!--      /quad_0/lidar_pose：官方该输入语义就是传感器(lidar)原点位姿  -->
+  <!--      （vehicleSimulator z=terrainZ+车高），上次错接机体中心       -->
+  <!--      body_pose，射线原点系统性偏 ~0.4m。                         -->
+  <!--   3. 参数全回官方 indoor 基准；用户决策保留 max_range=5m 与       -->
+  <!--      z 切片 [0.2,0.8]。不再预埋对抗性补丁。                      -->
+  <!-- ============================================================ -->
+
+  <!-- 收发量程沿革（2026-08-25 术语勘误：官方配方 = 上游原版默认 20m，本机无
+       完整跑通记录；envB.log 的 7m 是「本机自设参数跑通官方 demo」的现场值，
+       不是官方配方）：官方配方 20 → 本机跑通记录 envB 7（run9 曾整体回退以隔离
+       幻影墙变量）→ 用户 5 → 3 → 4 → 10 → 6.5 → 6。
+       **终版 6m（2026-08-25 用户多轮实测拍板，不再改动）**：有效效用环 = 6×0.5 = 3.0m。
+       另注：「黄点消失」=SCAN optimal_traj 无更新=断供信号，可肉眼判链路死活。 -->
+  <arg name="sensor_range" default="4"/>
+  <arg name="planner_sensor_range" default="4"/>
+  <!-- 2026-08-24 用户决策 res 两连跳：0.4→0.3→0.2（动机：0.4 下全场覆盖不全、
+       门洞表示粗）。幻影墙免疫的格点几何随之换算：体素中心层变 0.1/0.3/0.5/0.7…，
+       地面端点落中心 0.1 层，0.1+半格0.1=0.2 > min_z=0.2 恒假 → 地面永不投影
+       （规则不变：min_z ≥ 一个整格）——用户原始 z 带 [0.2,0.8] 至此完整回收。
+       ⚠ 负载：octomap 相对原版 0.4 为 (0.4/0.2)³≈8×，rl_planner 图规模 ≈4×，
+       Orin NX 实机部署前必须实测 replan 周期；仿真中先观察卡顿。
+       ⚠ octomap resolution 与 rl_planner map_resolution 必须同步改：
+       rl_planner 只信自己的 param 不读消息头，不一致=全图几何错位。 -->
+  <arg name="map_resolution" default="0.2"/>
+  <arg name="replanning_frequency" default="2.5"/>
+  <arg name="map_update_frequency" default="10.0"/>
+  <arg name="compress_map" default="true"/>
+  <arg name="node_resolution" default="2.0"/>
+  <arg name="map_topic" default="/projected_map"/>
+  <arg name="waypoint_update_min_interval" default="0.0"/>
+  <!-- 真机可覆盖参数（2026-09-04）：默认保持原仿真行为，sim 什么都不传即为原版。
+       real.launch 按 FAST-LIO 启动姿态(mode:=prone/stand)传真机值。 -->
+  <arg name="occupancy_min_z" default="0.2"/>
+  <arg name="occupancy_max_z" default="0.8"/>
+  <arg name="projected_map_topic" default="/projected_map"/>
+  <arg name="filter_ground" default="true"/>
+  <!-- use_planner=false 时只跑地图链(sensor_scan_generation+octomap+map_world_bridge)，不跑 rl_planner：
+       供 SCAN 手动模式查看 /projected_map 但禁用 ARiADNE 决策。默认 true=原版。 -->
+  <arg name="use_planner" default="true"/>
+
+  <!-- map→world 恒等桥（100ms 周期）。octomap/RViz 的 frame 字符串 "map"
+       由此可解析且数值不变；rl_planner 输出 way_point(frame=map) 同样受益。 -->
+  <node pkg="tf" type="static_transform_publisher" name="map_world_bridge"
+        args="0 0 0 0 0 0 1 map world 100"/>
+
+  <!-- 官方包零改动复用：世界系点云转回传感器瞬时系 + 用点云时间戳广播
+       TF map→sensor_at_scan + 发布 /state_estimation_at_scan。
+       ApproximateTime(100) 同步两输入；required 未设（挂了只断地图不断仿真）。 -->
+  <node pkg="sensor_scan_generation" type="sensorScanGeneration" name="sensor_scan_generation" output="screen">
+    <remap from="/registered_scan" to="/mid360_points_clean"/>
+    <remap from="/state_estimation" to="/quad_0/lidar_pose"/>
+  </node>
+
+  <!-- octomap_server：apt 二进制。tf::MessageFilter 门控——点云在其 stamp
+       时刻必须能 TF 到 map，否则被扣住（表现为地图空/滞后）。 -->
+  <node pkg="topic_tools" type="throttle" name="exploration_map_throttle" args="messages /sensor_scan $(arg map_update_frequency) /sensor_scan_mapping"/>
+  <node pkg="octomap_server" type="octomap_server_node" name="octomap" output="screen">
+    <remap from="cloud_in" to="/sensor_scan_mapping"/>
+    <remap from="/projected_map" to="$(arg projected_map_topic)"/>
+    <param name="frame_id" value="map"/>
+    <!-- 地面过滤（幻影墙根治，2026-08-24）：我们的场景有无限大 ground_plane，官方场景没有——
+         这是与官方跑通版唯一的输入差异。地面回波若不过滤，端点会以体素中心 z=0.2 标占据
+         （恰在带内），整片可见地板变黑。filter_ground=true 时 RANSAC 把 z≈0 平面归为
+         「只清空不占据」；base_frame_id 必须设为 world：该参数只服务地面过滤的高度判定
+         （源码 filterGroundPlane 在 base 系里要求平面 |d|<0.07 才算地面，用雷达系会因
+         雷达离地 0.458m 而永远判不上）。 -->
+    <param name="base_frame_id" value="world"/>
+    <param name="filter_ground" value="$(arg filter_ground)"/>
+    <param name="resolution" value="$(arg map_resolution)"/>
+    <param name="compress_map" value="$(arg compress_map)"/>
+    <!-- z∈[0.2,0.8]（2026-08-24 随 res=0.2 联动，用户原始偏好在 0.2 格下达成）：
+         免疫规则不变——min_z ≥ 一个整格。res=0.2 体素中心层 0.1/0.3/0.5/0.7…，
+         地面端点(z≈0)落中心 0.1 层，0.1+0.1=0.2 > 0.2 恒假 → 地面/庭院回波
+         无论 RANSAC 成败都进不了黑格；真实障碍经中心 0.3/0.5/0.7 层照常投影
+         （精确覆盖物高 0.2~0.8m 四足有效障碍带）。filter_ground 保留作辅助
+         （RANSAC 在地面点占比<5% 时不可靠）。 -->
+    <param name="occupancy_min_z" type="double" value="$(arg occupancy_min_z)"/>
+    <param name="occupancy_max_z" type="double" value="$(arg occupancy_max_z)"/>
+    <!-- max_range=6m（2026-08-25 用户终版决策，多轮实测后拍板不再改）。沿革：
+         官方配方（上游原版默认）20 → 本机跑通记录 envB 7（非官方默认）→
+         用户 5 → 3 → 4 → 10 → 6.5 → 6。
+         注意与 rl_planner sensor_range 保持同值（官方即同 arg 耦合）。 -->
+    <param name="sensor_model/max_range" value="$(arg sensor_range)"/>
+    <param name="sensor_model/hit" type="double" value="0.70"/>
+    <param name="sensor_model/miss" type="double" value="0.40"/>
+    <param name="sensor_model/max" type="double" value="0.97"/>
+    <param name="sensor_model/min" type="double" value="0.12"/>
+  </node>
+
+  <!-- rl_planner：scripts 为官方原版一字未改（含 checkpoint 权重）。
+       其内部零 TF 查询，把 projected_map.origin 与位姿当裸数字混算——
+       数值一致性由本链路构造保证（里程计≡世界坐标，见 third_party.md）。 -->
+  <group if="$(arg use_planner)">
+  <node pkg="rl_planner" type="run_planner.sh" name="rl_planner" output="screen" cwd="node">
+    <!-- 决策层要的是机器人所在位置（机体中心即可，x/y 差 <1 格）；
+         与上面建图用的 lidar_pose 分开接，各取所需。 -->
+    <remap from="/state_estimation" to="/quad_0/body_pose"/>
+    <param name="map_topic" value="$(arg map_topic)"/>
+    <param name="publish_graph" type="bool" value="true"/>
+    <param name="node_resolution" value="$(arg node_resolution)"/>
+    <param name="sensor_range" value="$(arg planner_sensor_range)"/>
+    <!-- AB-0（2026-08-28）：恢复 e438 决策语义——utility 0.5 + escape OFF + 停滞完成 OFF。
+         一次一个变量，AB-1/2 逐项加回。 -->
+    <param name="utility_range_factor" value="0.5"/>
+    <param name="min_utility" type="int" value="3"/>
+    <param name="frontier_downsample_factor" value="1"/>
+    <param name="map_resolution" value="$(arg map_resolution)"/>
+    <param name="waypoint_threshold" value="2.0"/>
+    <param name="next_waypoint_threshold" value="4.0"/>
+    <param name="hard_update_threshold" value="10.0"/>
+    <param name="frontier_cluster_range" value="10.0"/>
+    <param name="enable_save_mode" value="false"/>
+    <param name="enable_dstarlite" value="false"/>
+    <param name="enable_escape_recovery" value="false"/>
+    <param name="escape_min_distance" value="4.0"/>
+    <param name="escape_required_displacement" value="6.0"/>
+    <param name="escape_required_map_growth" value="20"/>
+    <param name="stalled_complete_seconds" value="0.0"/>
+    <param name="replanning_frequency" value="$(arg replanning_frequency)"/>
+    <param name="waypoint_update_min_interval" value="$(arg waypoint_update_min_interval)"/>
+  </node>
+  </group>
+</launch>

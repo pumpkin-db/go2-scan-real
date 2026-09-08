@@ -1,0 +1,141 @@
+<launch>
+  <!-- One production graph for NX MID360 + FAST-LIO + SCAN + AR map. -->
+  <arg name="fastlio_config" default="$(env HOME)/Go2/2D/FAST-LIO/src/FAST_LIO/config/mid360.yaml"/>
+  <arg name="driver_config" default="$(env HOME)/Go2/2D/FAST-LIO/src/livox_ros_driver2/config/MID360_config.json"/>
+  <arg name="navigation_mode" default="auto"/>
+  <arg name="mode" default="prone"/>
+  <arg name="rviz" default="false"/>
+
+  <arg name="navi_mode" value="$(eval 3 if navigation_mode == 'auto' else 1)"/>
+  <arg name="ar_planner" value="$(eval navigation_mode == 'auto')"/>
+  <arg name="ground_z" value="$(eval -0.310 if mode == 'prone' else -0.565)"/>
+  <arg name="ar_min_z" value="$(eval -0.110 if mode == 'prone' else -0.365)"/>
+  <arg name="ar_max_z" value="$(eval 0.490 if mode == 'prone' else 0.235)"/>
+
+  <param name="use_sim_time" value="false"/>
+
+  <!-- NX owns this driver.  Board-side resident drivers are outside this graph. -->
+  <param name="xfer_format" value="1"/>
+  <param name="multi_topic" value="0"/>
+  <param name="data_src" value="0"/>
+  <param name="publish_freq" type="double" value="10.0"/>
+  <param name="output_data_type" value="0"/>
+  <param name="cmdline_str" type="str" value="100000000000000"/>
+  <param name="cmdline_file_path" value="livox_test.lvx"/>
+  <param name="user_config_path" value="$(arg driver_config)"/>
+  <param name="frame_id" value="livox_frame"/>
+  <param name="enable_lidar_bag" value="false"/>
+  <param name="enable_imu_bag" value="false"/>
+  <node pkg="livox_ros_driver2" type="livox_ros_driver2_node" name="nx_fastlio_livox" required="true" output="screen"/>
+
+  <!-- This fork uses a regular NodeHandle, so load its parameters in the node namespace. -->
+  <group ns="nx_fastlio">
+    <rosparam command="load" file="$(arg fastlio_config)"/>
+    <!-- These belong to the official mapping_mid360.launch rather than its
+         YAML, so custom entry points must carry them explicitly. -->
+    <param name="feature_extract_enable" type="bool" value="false"/>
+    <param name="point_filter_num" type="int" value="3"/>
+    <param name="max_iteration" type="int" value="3"/>
+    <param name="filter_size_surf" type="double" value="0.5"/>
+    <param name="filter_size_map" type="double" value="0.5"/>
+    <param name="cube_side_length" type="double" value="1000"/>
+    <param name="runtime_pos_log_enable" type="bool" value="false"/>
+    <param name="common/lid_topic" value="/livox/lidar"/>
+    <param name="common/imu_topic" value="/livox/imu"/>
+    <param name="pcd_save/pcd_save_en" value="false"/>
+    <param name="publish/scan_publish_en" value="true"/>
+    <param name="publish/scan_bodyframe_pub_en" value="true"/>
+    <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping" required="true" output="screen"/>
+  </group>
+
+  <node pkg="go2_mid360_raw" type="fastlio_output_adapter.py" name="fastlio_output_adapter"
+        required="true" output="screen">
+    <param name="config" value="$(arg fastlio_config)"/>
+  </node>
+
+  <!-- AR-only input cleanup.  Height slicing happens in projected_map, not here. -->
+  <node pkg="go2_bridge" type="cloud_range_filter.py" name="cloud_range_filter" required="true" output="screen">
+    <param name="min_range" value="0.7"/>
+    <param name="max_range" value="5.0"/>
+    <param name="confirmation_frames" value="2"/>
+    <param name="confirmation_voxel" value="0.1"/>
+    <param name="confirmation_window" value="1.0"/>
+  </node>
+
+  <!-- SCAN official parameter file is included without parameter overrides. -->
+  <param name="body_pose_topic" value="/LIO/odom_vehicle" type="str"/>
+  <include file="$(find scan_planner)/launch/advanced_param.xml">
+    <arg name="is_real_world" value="true"/>
+    <arg name="navi_mode" value="$(arg navi_mode)"/>
+    <arg name="sensor_type" value="lidar"/>
+    <arg name="body_pose_topic" value="/LIO/odom_vehicle"/>
+    <arg name="sensor_pose_topic" value="/LIO/odom_imu"/>
+    <arg name="cloud_topic" value="/LIO/clouds_lidar"/>
+    <arg name="cloud_is_world" value="false"/>
+    <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw"/>
+    <arg name="cx" value="317.19183349609375"/>
+    <arg name="cy" value="256.4806823730469"/>
+    <arg name="fx" value="609.5884399414062"/>
+    <arg name="fy" value="609.22021484375"/>
+  </include>
+  <node pkg="scan_planner" name="closed_loop_controller" type="closed_loop_controller" required="true" output="screen">
+    <remap from="cmd_vel" to="/scan_planner/cmd_vel"/>
+  </node>
+  <node pkg="go2_mid360_raw" name="cmd_vel_safety_gate" type="cmd_vel_safety_gate.py"
+        required="true" output="screen">
+    <param name="odom_timeout" value="0.5"/>
+    <param name="command_timeout" value="0.25"/>
+  </node>
+  <param name="robot_description" textfile="$(find go2_description)/urdf/go2_description.urdf"/>
+  <node pkg="robot_state_publisher" type="robot_state_publisher" name="go2_robot_state_publisher" output="screen"/>
+  <node pkg="scan_planner" name="go2_gait_publisher" type="go2_gait_publisher" output="screen"/>
+  <node pkg="odom_visualization" type="odom_visualization" name="odom_visualization" output="screen"/>
+
+  <!-- Existing accumulated display topic; throttle only this visualization
+       branch to 1Hz.  SCAN collision checking keeps the full 10Hz cloud. -->
+  <node pkg="topic_tools" type="throttle" name="scanmap_throttle"
+        args="messages /mid360_points 1.0 /mid360_points_scanmap"/>
+  <node pkg="go2_bridge" name="scan_cloud_accumulator" type="scan_cloud_accumulator.py" output="screen">
+    <remap from="/mid360_points" to="/mid360_points_scanmap"/>
+    <param name="voxel_size" value="0.20"/>
+    <param name="reset_interval" value="20.0"/>
+    <param name="max_range" value="40.0"/>
+    <param name="save_dir" value="$(env HOME)/Go2/2D/go2-scan/real"/>
+  </node>
+
+  <!-- AR map is always present.  Only the automatic entry enables its planner. -->
+  <include file="$(find rl_planner)/launch/go2_ariadne.launch">
+    <arg name="map_topic" value="/projected_map"/>
+    <arg name="map_resolution" value="0.1"/>
+    <arg name="compress_map" value="false"/>
+    <arg name="replanning_frequency" value="1.5"/>
+    <arg name="map_update_frequency" value="2.0"/>
+    <arg name="sensor_range" value="6.0"/>
+    <arg name="planner_sensor_range" value="6.0"/>
+    <arg name="waypoint_update_min_interval" value="0.5"/>
+    <arg name="occupancy_min_z" value="$(arg ar_min_z)"/>
+    <arg name="occupancy_max_z" value="$(arg ar_max_z)"/>
+    <arg name="projected_map_topic" value="/projected_map_occ"/>
+    <arg name="filter_ground" value="false"/>
+    <arg name="use_planner" value="$(arg ar_planner)"/>
+  </include>
+
+  <node pkg="go2_bridge" name="projected_map_ground" type="projected_map_ground.py" output="screen">
+    <param name="ground_z" value="$(arg ground_z)" type="double"/>
+    <param name="in_topic" value="/projected_map_occ"/>
+    <param name="out_topic" value="/projected_map"/>
+  </node>
+
+  <group if="$(arg ar_planner)">
+    <node pkg="go2_bridge" name="ariadne_goal_bridge" type="ariadne_goal_bridge.py" required="true" output="screen">
+      <param name="repub_dist" value="0.5"/>
+      <param name="target_min_clearance" value="0.25"/>
+      <param name="target_search_radius" value="3.0"/>
+      <param name="floor_z_ref" value="$(arg ground_z)"/>
+    </node>
+  </group>
+
+  <group if="$(arg rviz)">
+    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find scan_planner)/launch/default.rviz"/>
+  </group>
+</launch>

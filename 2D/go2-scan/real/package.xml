@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>go2_mid360_raw</name>
+  <version>0.0.1</version>
+  <description>Standalone MID360 raw cloud viewing tools.</description>
+  <maintainer email="unitree@localhost">unitree</maintainer>
+  <license>BSD-3-Clause</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+  <exec_depend>fast_lio</exec_depend>
+  <exec_depend>scan_planner</exec_depend>
+</package>

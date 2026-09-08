@@ -1,0 +1,26 @@
+# Generated workspaces and local runtime state
+.build/
+.venv/
+.cache/
+**/build/
+**/devel/
+**/install/
+**/logs/
+**/Log/
+**/PCD/
+**/__pycache__/
+*.pyc
+*.pyo
+*.log
+*.bag
+*.pcd
+*.swp
+*.bak
+*.bak_*
+
+# Machine-local credentials. Keep the directory marker only.
+config/local/*
+!config/local/.gitignore
+
+# Explicitly retired from the real release.
+2D/POINT-LIO/
