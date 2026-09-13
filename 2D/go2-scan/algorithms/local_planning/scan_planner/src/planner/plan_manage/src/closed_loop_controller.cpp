@@ -8,6 +8,7 @@
 #include <nav_msgs/Odometry.h>
 #include <ros/ros.h>
 #include <std_msgs/Bool.h>
+#include <std_msgs/Int32.h>
 #include <tf/tf.h>
 
 #include "bspline_opt/uniform_bspline.h"
@@ -23,6 +24,9 @@ ros::Publisher cmd_vel_pub;
 ros::Publisher execution_frozen_pub;
 ros::Subscriber bspline_sub;
 ros::Subscriber odom_sub;
+ros::Subscriber stop_traj_sub;
+ros::Publisher finished_traj_pub;
+int stopped_through = -1;
 ros::Timer cmd_timer;
 
 bool receive_traj = false;
@@ -39,6 +43,7 @@ ros::Time last_update_time;
 
 double time_forward;
 double heading_error_threshold;
+double heading_slowdown_start;
 double kp_pos;
 double kp_yaw;
 double max_vx;
@@ -62,12 +67,18 @@ bool loadParams(const ros::NodeHandle &nh)
   ros::param::param<std::string>("/body_pose_topic", body_pose_topic, std::string("/quad_0/body_pose"));
   ok &= loadRequiredParam(nh, "time_forward", time_forward);
   ok &= loadRequiredParam(nh, "heading_error_threshold", heading_error_threshold);
+  ok &= loadRequiredParam(nh, "heading_slowdown_start", heading_slowdown_start);
   ok &= loadRequiredParam(nh, "kp_pos", kp_pos);
   ok &= loadRequiredParam(nh, "kp_yaw", kp_yaw);
   ok &= loadRequiredParam(nh, "max_vx", max_vx);
   ok &= loadRequiredParam(nh, "max_vy", max_vy);
   ok &= loadRequiredParam(nh, "max_vyaw", max_vyaw);
   ok &= loadRequiredParam(nh, "finish_dist", finish_dist);
+  if (ok && (heading_slowdown_start < 0.0 || heading_slowdown_start >= heading_error_threshold))
+  {
+    ROS_ERROR("[closed_loop_controller] require 0 <= heading_slowdown_start < heading_error_threshold.");
+    ok = false;
+  }
   if (ok && max_vyaw > kMaxVYawLimit)
   {
     ROS_WARN("[closed_loop_controller] cap max_vyaw %.3f to %.3f rad/s.", max_vyaw, kMaxVYawLimit);
@@ -131,6 +142,7 @@ void publishExecutionFrozen(bool frozen)
 
 void bsplineCallback(const scan_planner::BsplineConstPtr &msg)
 {
+  if (msg->traj_id <= stopped_through) return;
   Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
   Eigen::VectorXd knots(msg->knots.size());
 
@@ -192,7 +204,7 @@ void cmdCallback(const ros::TimerEvent &)
   const double yaw_err = normalizeAngle(yaw_des - odom_yaw);
   const double vyaw_cmd = clamp(kp_yaw * yaw_err, -max_vyaw, max_vyaw);
 
-  if (std::abs(yaw_err) > heading_error_threshold)
+  if (std::abs(yaw_err) >= heading_error_threshold)
   {
     publishExecutionFrozen(true);
     publishStop(vyaw_cmd);
@@ -211,6 +223,16 @@ void cmdCallback(const ros::TimerEvent &)
   Eigen::Vector2d vel_ff(vel_des(0), vel_des(1));
   Eigen::Vector2d vel_world = clampNorm(vel_ff + kp_pos * pos_err, std::max(max_vx, max_vy));
 
+  const double abs_yaw_err = std::abs(yaw_err);
+  if (abs_yaw_err > heading_slowdown_start)
+  {
+    const double heading_speed_scale = clamp(
+        (heading_error_threshold - abs_yaw_err) /
+            (heading_error_threshold - heading_slowdown_start),
+        0.0, 1.0);
+    vel_world *= heading_speed_scale;
+  }
+
   const double c = std::cos(odom_yaw);
   const double s = std::sin(odom_yaw);
   geometry_msgs::Twist cmd;
@@ -219,7 +241,12 @@ void cmdCallback(const ros::TimerEvent &)
   cmd.angular.z = vyaw_cmd;
 
   if (exec_time >= traj_duration && pos_err.norm() < finish_dist)
+  {
     cmd = geometry_msgs::Twist();
+    std_msgs::Int32 finished;
+    finished.data = traj_id;
+    finished_traj_pub.publish(finished);
+  }
 
   cmd_vel_pub.publish(cmd);
 }
@@ -230,6 +257,16 @@ int main(int argc, char **argv)
   ros::init(argc, argv, "closed_loop_controller");
   ros::NodeHandle node;
   ros::NodeHandle nh("~");
+  finished_traj_pub = node.advertise<std_msgs::Int32>("/planning/finished_trajectory", 10);
+  stop_traj_sub = node.subscribe<std_msgs::Int32>("/planning/stop_trajectory", 10,
+      +[](const std_msgs::Int32::ConstPtr &m) {
+        stopped_through = std::max(stopped_through, m->data);
+        if (receive_traj && traj_id <= stopped_through)
+        {
+          receive_traj = false;
+          publishStop();
+        }
+      });
 
   if (!loadParams(nh))
     return 1;

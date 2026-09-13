@@ -8,6 +8,7 @@ import rospy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from scan_planner.msg import Bspline
+from std_msgs.msg import String
 
 
 class SafetyGate:
@@ -20,7 +21,9 @@ class SafetyGate:
         self.last_command_wall = None
         self.command = Twist()
         self.unlocked = False
+        self.ever_trajectory = False
         self.publisher = rospy.Publisher('/cmd_vel', Twist, queue_size=2)
+        self.status_pub = rospy.Publisher('/cmd_vel_gate/status', String, queue_size=2)
         rospy.Subscriber('/LIO/odom_vehicle', Odometry, self.on_odom, queue_size=2,
                          tcp_nodelay=True)
         rospy.Subscriber('/scan_planner/cmd_vel', Twist, self.on_command, queue_size=2,
@@ -62,6 +65,7 @@ class SafetyGate:
     def on_trajectory(self, _message):
         now = time.monotonic()
         with self.lock:
+            self.ever_trajectory = True
             if self.odom_fresh(now):
                 self.unlocked = True
                 rospy.logwarn('cmd_vel safety gate unlocked by a new trajectory')
@@ -74,7 +78,12 @@ class SafetyGate:
             if not self.odom_fresh(now):
                 self.unlocked = False
             output = self.command if self.unlocked and command_fresh else Twist()
+            status = ('ODOM_STALE' if not self.odom_fresh(now) else
+                      'COMMAND_STALE' if not command_fresh else
+                      'READY' if self.unlocked else
+                      'WAIT_TRAJECTORY' if not self.ever_trajectory else 'LOCKED')
         self.publisher.publish(output)
+        self.status_pub.publish(String(status))
 
     def on_shutdown(self):
         stop = Twist()

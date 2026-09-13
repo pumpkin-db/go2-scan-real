@@ -10,6 +10,7 @@ fastlio_config="${FASTLIO_CONFIG:-$fastlio_ws/src/FAST_LIO/config/mid360.yaml}"
 driver_config="${LIVOX_CONFIG:-$fastlio_ws/src/livox_ros_driver2/config/MID360_config.json}"
 scan_ws="${SCAN:-$go2_root/algorithms/local_planning/scan_planner}"
 sensor_scan_ws="${SENSOR_SCAN_WS:-$HOME/Go2/2D/SENSOR-SCAN}"
+elevation_ws="${ELEVATION_WS:-$HOME/Go2/2D/ELEVATION-MAPPING}"
 ariadne="${ARIADNE:-$go2_root/algorithms/global_planning/ariadne}"
 motion_ws="$go2_root/integration/go2_motion"
 log_dir="$script_dir/logs/fastlio_navigation"
@@ -19,6 +20,7 @@ motion=false
 record_bag=false
 rviz=false
 check=false
+elevation=false
 for argument in "$@"; do
   case "$argument" in
     navigation:=auto) navigation=auto;;
@@ -31,6 +33,9 @@ for argument in "$@"; do
     rviz:=true) rviz=true;;
     rviz:=false) rviz=false;;
     rviz:=*) echo "[FATAL] invalid rviz argument: $argument" >&2; exit 2;;
+    elevation:=true) elevation=true;;
+    elevation:=false) elevation=false;;
+    elevation:=*) echo "[FATAL] invalid elevation argument: $argument" >&2; exit 2;;
     config:=*) fastlio_config="${argument#config:=}";;
     driver:=*) echo '[FATAL] FAST-LIO正式入口固定使用NX本地驱动，不接受driver参数' >&2; exit 2;;
     --check) check=true;;
@@ -46,11 +51,13 @@ mode=prone
 [ -r "$fastlio_config" ] || fail "missing FAST-LIO config: $fastlio_config"
 [ -r "$driver_config" ] || fail "missing Livox driver config: $driver_config"
 [ -r "$sensor_scan_ws/devel/setup.bash" ] || fail "sensor scan workspace has not been built: $sensor_scan_ws"
+[ "$elevation" = false ] || [ -r "$elevation_ws/devel/setup.bash" ] || fail "elevation workspace has not been built: $elevation_ws"
 [ "$navigation" = auto ] || [ "$navigation" = manual ] || fail "invalid navigation mode: $navigation"
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 source /opt/ros/noetic/setup.bash
 source "$fastlio_ws/devel/setup.bash"
+[ "$elevation" = false ] || source "$elevation_ws/devel/setup.bash" --extend
 source "$scan_ws/devel/setup.bash" --extend
 source "$sensor_scan_ws/devel/setup.bash" --extend
 export PYTHONPATH="$scan_ws/devel/lib/python3/dist-packages:${PYTHONPATH:-}"
@@ -65,30 +72,36 @@ fi
 
 [ "$(rospack find fast_lio)" = "$fastlio_ws/src/FAST_LIO" ] || fail 'wrong fast_lio package resolved'
 [ "$(rospack find scan_planner)" = "$scan_ws/src/planner/plan_manage" ] || fail 'wrong scan_planner package resolved'
+[ "$elevation" = false ] || [ "$(rospack find go2_elevation)" = "$go2_root/algorithms/elevation_mapping/go2_integration" ] || fail 'wrong go2_elevation package resolved'
 [ -x "$fastlio_ws/devel/lib/fast_lio/fastlio_mapping" ] || fail 'missing FAST-LIO executable'
 [ -x "$fastlio_ws/devel/lib/livox_ros_driver2/livox_ros_driver2_node" ] || fail 'missing Livox driver executable'
 [ -x "$scan_ws/devel/lib/scan_planner/scan_planner_node" ] || fail 'missing SCAN executable'
+[ "$elevation" = false ] || [ -x "$elevation_ws/devel/lib/elevation_mapping/elevation_mapping" ] || fail 'missing elevation_mapping executable'
 if [ "$motion" = true ]; then
   [ -x "$motion_ws/build/go2_standup" ] || fail 'missing RecoveryStand helper'
   [ -x "$motion_ws/build/cmd_vel_bridge" ] || fail 'missing Go2 cmd_vel bridge'
 fi
 
-echo "[FAST-LIO NX] navigation=$navigation motion=$motion mode=$mode ROS_IP=$ROS_IP"
-echo '[PARAM] FAST-LIO input/odom=10Hz; SCAN=current phase-1 parameters; AR map=2Hz, replan=1.5Hz, resolution=0.1m, range=6m'
-echo '[PARAM] AR obstacle projection=0.2-0.8m above ground; AR voxel requires two input frames; SCAN cloud is not height-sliced'
+echo "[FAST-LIO NX] navigation=$navigation motion=$motion mode=$mode elevation=$elevation ROS_IP=$ROS_IP"
+echo '[PARAM] FAST-LIO input/odom=10Hz; SCAN=current phase-1 parameters; AR map=2Hz, replan=1.5Hz, resolution=0.1m, range=5m'
+if [ "$elevation" = true ]; then
+  echo '[PARAM] elevation mode: official local elevation map drives AR; global display map=0.2m/0.5Hz/cap100000 cells'
+else
+  echo '[PARAM] default 2-D mode: AR mapping Z is locked; SCAN samples current body Z once per new goal'
+fi
 echo '[GUI] keep using ~/Go2/2D/launch_real_rviz.sh; legacy topics are preserved'
 
 if [ "$check" = true ]; then
   roslaunch --nodes "$script_dir/fastlio_stack_NX.launch" \
     fastlio_config:="$fastlio_config" driver_config:="$driver_config" \
-    navigation_mode:="$navigation" mode:="$mode" rviz:="$rviz"
+    navigation_mode:="$navigation" mode:="$mode" rviz:="$rviz" elevation:="$elevation"
   exit 0
 fi
 
 mkdir -p "$log_dir"
 exec 9>"$log_dir/launcher.lock"
 flock -n 9 || fail 'another FAST-LIO navigation launcher owns the NX stack'
-if pgrep -f '[l]ivox_ros_driver2_node|[f]astlio_mapping|[p]ointlio_mapping|[s]can_planner_node|[c]losed_loop_controller|[c]md_vel_bridge|[r]l_planner.py|[o]ctomap_server_node|[f]astlio_output_adapter.py|[c]md_vel_safety_gate.py|[s]can_cloud_accumulator.py' >/dev/null; then
+if pgrep -f '[l]ivox_ros_driver2_node|[f]astlio_mapping|[p]ointlio_mapping|[s]can_planner_node|[c]losed_loop_controller|[c]md_vel_bridge|[r]l_planner.py|[o]ctomap_server_node|[f]astlio_output_adapter.py|[c]md_vel_safety_gate.py|[s]can_cloud_accumulator.py|[e]levation_mapping|[g]o2_elevation_products|[g]o2_elevation_visualization' >/dev/null; then
   fail 'a local LiDAR/SLAM/navigation process is already active; stop its owning launcher first'
 fi
 
@@ -99,7 +112,7 @@ timeout 60 python3 "$script_dir/sync_mid360_clock.py" | tee "$log_dir/clock.log"
 # FAST-LIO fixes its map origin at startup. For motion=true, issue one
 # RecoveryStand command and wait for that command helper to finish before
 # consuming LiDAR/IMU. Do not infer posture from SportModeState.mode here;
-# the fixed height model is selected solely from the motion argument.
+# the initial prone/stand height is selected solely from the motion argument.
 if [ "$motion" = true ]; then
   "$motion_ws/build/go2_standup" eth10 2>&1 | tee "$log_dir/stand.log" \
     || fail 'RecoveryStand command failed'
@@ -131,6 +144,12 @@ start() {
   setsid "$@" >"$log_dir/$logfile" 2>&1 &
   pids+=("$!")
 }
+start_console() {
+  local logfile="$1"
+  shift
+  setsid "$@" > >(tee -a "$log_dir/$logfile") 2>&1 &
+  pids+=("$!")
+}
 
 if ! timeout 2 rosparam list >/dev/null 2>&1; then
   start roscore.log roscore
@@ -141,7 +160,7 @@ fi
 
 start stack.log roslaunch "$script_dir/fastlio_stack_NX.launch" \
   fastlio_config:="$fastlio_config" driver_config:="$driver_config" \
-  navigation_mode:="$navigation" mode:="$mode" rviz:="$rviz"
+  navigation_mode:="$navigation" mode:="$mode" rviz:="$rviz" elevation:="$elevation"
 stack_pid="${pids[-1]}"
 wait_topic() {
   local topic="$1"
@@ -160,9 +179,15 @@ wait_topic /LIO/clouds_lidar 20 || fail 'FAST-LIO adapter did not publish SCAN c
 wait_topic /LIO/odom_vehicle 10 || fail 'FAST-LIO adapter did not publish vehicle odometry'
 wait_topic /grid_map/occupancy 30 || fail 'SCAN did not publish its official occupancy map'
 wait_topic /projected_map 30 || fail 'AR map did not publish /projected_map'
+if [ "$elevation" = true ]; then
+  wait_topic /local_elevation_map 30 || fail 'elevation mode did not publish /local_elevation_map'
+  wait_topic /global_elevation_map 30 || fail 'elevation mode did not publish /global_elevation_map'
+fi
 python3 "$script_dir/check_odom_health.py" _topic:=/Odometry _duration:=8.0 \
   _min_rate:=8.0 _max_gap:=0.2 _max_age:=0.5 _max_future:=0.05 _min_stamp_progress:=0.9 \
   || fail 'FAST-LIO odometry health check failed'
+
+start_console navigation_status.log python3 "$script_dir/navigation_status_monitor.py"
 
 echo '[READY] FAST-LIO、SCAN和AR地图已就绪；GUI接口保持不变'
 if [ "$navigation" = auto ]; then
@@ -173,14 +198,19 @@ fi
 
 if [ "$motion" = true ]; then
   start cmd_vel_bridge.log "$motion_ws/build/cmd_vel_bridge" _interface:=eth10 _auto_stand:=false \
-    _disable_avoid:=false _cmd_timeout_s:=0.5 _max_linear_speed:=0.5 _max_angular_speed:=0.7
+    _disable_avoid:=false _cmd_timeout_s:=0.5 _max_linear_speed:=0.5 _max_angular_speed:=0.8
 else
   echo '[SAFE] motion=false：未调用RecoveryStand，未启动Unitree运动桥'
 fi
+rosparam set /ariadne/execution_ready true
 if [ "$record_bag" = true ]; then
   start rosbag.log rosbag record -O "$log_dir/fastlio_$(date +%Y%m%d_%H%M%S).bag" \
     /livox/lidar /livox/imu /Odometry /cloud_registered /LIO/clouds_lidar \
     /LIO/odom_vehicle /grid_map/occupancy /projected_map /cmd_vel /tf /tf_static
+  if [ "$elevation" = true ]; then
+    start elevation_rosbag.log rosbag record -O "$log_dir/elevation_$(date +%Y%m%d_%H%M%S).bag" \
+      /local_elevation_map /local_elevation_cloud /local_traversability_map /global_elevation_map
+  fi
 fi
 
 while kill -0 "$stack_pid" 2>/dev/null; do

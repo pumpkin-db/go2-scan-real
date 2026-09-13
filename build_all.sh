@@ -22,6 +22,12 @@ if [ ! -e "$ROOT/2D/SENSOR-SCAN/src/CMakeLists.txt" ]; then
 fi
 (cd "$ROOT/2D/SENSOR-SCAN" && catkin_make -DCMAKE_BUILD_TYPE=Release -j2)
 
+# Build the optional elevation:=true branch as a separate workspace.  The
+# default 2-D launch remains elevation:=false and does not start these nodes.
+ELEVATION_ROOT="$ROOT/2D/go2-scan/algorithms/elevation_mapping"
+ELEVATION_WS="$ROOT/2D/ELEVATION-MAPPING" \
+  bash "$ELEVATION_ROOT/go2_integration/build_elevation_ws.sh"
+
 SCAN="$ROOT/2D/go2-scan/algorithms/local_planning/scan_planner"
 if [ ! -e "$SCAN/src/CMakeLists.txt" ]; then
   ln -s /opt/ros/noetic/share/catkin/cmake/toplevel.cmake "$SCAN/src/CMakeLists.txt"
@@ -33,4 +39,4 @@ cmake -S "$ROOT/2D/go2-scan/integration/go2_motion" \
   -DUNITREE_SDK_ROOT="$ROOT/third_party/unitree_sdk2" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$ROOT/2D/go2-scan/integration/go2_motion/build" -- -j2
 
-echo '[BUILD] FAST-LIO, Livox driver, sensor scan, SCAN and Go2 motion bridge built successfully'
+echo '[BUILD] FAST-LIO, Livox driver, sensor scan, optional elevation mapping, SCAN and Go2 motion bridge built successfully'

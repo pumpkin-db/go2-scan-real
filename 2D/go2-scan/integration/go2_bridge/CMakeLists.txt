@@ -9,6 +9,7 @@ find_package(catkin REQUIRED COMPONENTS
   tf
   std_srvs
   gazebo_msgs
+  dynamic_reconfigure
 )
 
 catkin_package()
@@ -17,5 +18,7 @@ catkin_package()
 catkin_install_python(PROGRAMS
   scripts/scan_cloud_accumulator.py
   scripts/ariadne_goal_bridge.py
+  scripts/projected_map_ground.py
+  scripts/ar_height_tracker.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

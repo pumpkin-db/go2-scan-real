@@ -22,7 +22,8 @@ if [ "$SKIP_APT" = false ]; then
     build-essential cmake python3-dev python3-pip python3-venv python3-paramiko \
     libboost-all-dev libeigen3-dev libpcl-dev libopencv-dev libarmadillo-dev \
     libnlopt-dev libyaml-cpp-dev libgoogle-glog-dev libapr1-dev \
-    ros-noetic-cv-bridge ros-noetic-octomap-server ros-noetic-pcl-ros \
+    ros-noetic-cv-bridge ros-noetic-eigen-conversions ros-noetic-grid-map \
+    ros-noetic-octomap-server ros-noetic-pcl-ros ros-noetic-tf-conversions \
     ros-noetic-robot-state-publisher ros-noetic-tf ros-noetic-tf2-ros \
     ros-noetic-topic-tools
 fi

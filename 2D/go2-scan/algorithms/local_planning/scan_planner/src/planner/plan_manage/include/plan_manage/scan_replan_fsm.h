@@ -11,6 +11,10 @@
 #include <ros/ros.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/Empty.h>
+#include <std_msgs/Int32.h>
+#include <std_msgs/Time.h>
+#include <scan_planner/GoalFeedback.h>
+#include <chrono>
 #include <vector>
 #include <visualization_msgs/Marker.h>
 
@@ -68,6 +72,7 @@ namespace scan_planner
     /* planning data */
     bool trigger_, have_target_, have_odom_, have_new_target_;
     bool rviz_height_ready_;
+    bool use_path_height_;
     bool go2_execution_frozen_;
     bool enable_fail_safe_, need_hover_stop_;
     FSM_EXEC_STATE exec_state_;
@@ -92,6 +97,17 @@ namespace scan_planner
     ros::Timer exec_timer_, safety_timer_;
     ros::Subscriber goal_sub_, odom_sub_, path_sub_, go2_execution_frozen_sub_;
     ros::Publisher replan_pub_, new_pub_, bspline_pub_, data_disp_pub_, self_inflation_pub_;
+    bool feedback_enabled_{false}, goal_tracking_{false};
+    double finish_distance_{0.6}, fail_since_{0}, reached_since_{0}, odom_received_{0};
+    int finished_traj_{-1};
+    double finished_received_{0};
+    scan_planner::GoalFeedback goal_feedback_;
+    ros::Publisher goal_feedback_pub_, stop_traj_pub_;
+    ros::Subscriber controller_done_sub_, cancel_goal_sub_;
+    ros::WallTimer goal_timer_;
+    static double monotonicNow();
+    void goalTick(const ros::WallTimerEvent &);
+    void finishGoal(uint8_t state, const std::string &reason);
 
     /* helper functions */
     bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method

@@ -35,9 +35,12 @@
   <arg name="map_resolution" default="0.2"/>
   <arg name="replanning_frequency" default="2.5"/>
   <arg name="map_update_frequency" default="10.0"/>
+  <arg name="octomap_visualization_frequency" default="1.0"/>
   <arg name="compress_map" default="true"/>
+  <arg name="incremental_2D_projection" default="false"/>
   <arg name="node_resolution" default="2.0"/>
   <arg name="map_topic" default="/projected_map"/>
+  <arg name="ground_z_ref" default="0.0"/>
   <arg name="waypoint_update_min_interval" default="0.0"/>
   <!-- 真机可覆盖参数（2026-09-04）：默认保持原仿真行为，sim 什么都不传即为原版。
        real.launch 按 FAST-LIO 启动姿态(mode:=prone/stand)传真机值。 -->
@@ -48,18 +51,30 @@
   <!-- use_planner=false 时只跑地图链(sensor_scan_generation+octomap+map_world_bridge)，不跑 rl_planner：
        供 SCAN 手动模式查看 /projected_map 但禁用 ARiADNE 决策。默认 true=原版。 -->
   <arg name="use_planner" default="true"/>
+  <!-- Alternate map providers (for example elevation traversability) can
+       keep the official AR planner while disabling only this OctoMap builder. -->
+  <arg name="use_map_builder" default="true"/>
+  <!-- Single-floor mode may keep the AR map in one Z frame even when LIO Z
+       drifts.  This affects only the AR OctoMap input, never SCAN or RViz. -->
+  <arg name="lock_mapping_z" default="false"/>
+  <arg name="lock_z_samples" default="20"/>
+  <arg name="lock_z_max_span" default="0.03"/>
 
-  <!-- map→world 恒等桥（100ms 周期）。octomap/RViz 的 frame 字符串 "map"
-       由此可解析且数值不变；rl_planner 输出 way_point(frame=map) 同样受益。 -->
-  <node pkg="tf" type="static_transform_publisher" name="map_world_bridge"
-        args="0 0 0 0 0 0 1 map world 100"/>
+  <!-- Truly static identity on /tf_static: retained goal timestamps remain
+       transformable even when RViz connects long after goal publication. -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="map_world_bridge"
+        args="0 0 0 0 0 0 1 map world"/>
 
   <!-- 官方包零改动复用：世界系点云转回传感器瞬时系 + 用点云时间戳广播
        TF map→sensor_at_scan + 发布 /state_estimation_at_scan。
        ApproximateTime(100) 同步两输入；required 未设（挂了只断地图不断仿真）。 -->
+  <group if="$(arg use_map_builder)">
   <node pkg="sensor_scan_generation" type="sensorScanGeneration" name="sensor_scan_generation" output="screen">
     <remap from="/registered_scan" to="/mid360_points_clean"/>
     <remap from="/state_estimation" to="/quad_0/lidar_pose"/>
+    <param name="lock_mapping_z" value="$(arg lock_mapping_z)" type="bool"/>
+    <param name="lock_z_samples" value="$(arg lock_z_samples)" type="int"/>
+    <param name="lock_z_max_span" value="$(arg lock_z_max_span)" type="double"/>
   </node>
 
   <!-- octomap_server：apt 二进制。tf::MessageFilter 门控——点云在其 stamp
@@ -68,6 +83,7 @@
   <node pkg="octomap_server" type="octomap_server_node" name="octomap" output="screen">
     <remap from="cloud_in" to="/sensor_scan_mapping"/>
     <remap from="/projected_map" to="$(arg projected_map_topic)"/>
+    <remap from="/occupied_cells_vis_array" to="/occupied_cells_vis_array_raw"/>
     <param name="frame_id" value="map"/>
     <!-- 地面过滤（幻影墙根治，2026-08-24）：我们的场景有无限大 ground_plane，官方场景没有——
          这是与官方跑通版唯一的输入差异。地面回波若不过滤，端点会以体素中心 z=0.2 标占据
@@ -79,6 +95,11 @@
     <param name="filter_ground" value="$(arg filter_ground)"/>
     <param name="resolution" value="$(arg map_resolution)"/>
     <param name="compress_map" value="$(arg compress_map)"/>
+    <!-- Dynamic height-band changes must rebuild the whole 2D projection.
+         OctomapServer::reconfigureCallback calls publishAll immediately; with
+         incremental projection disabled, handlePreNodeTraversal clears the
+         grid before traversing the full retained Octree. -->
+    <param name="incremental_2D_projection" type="bool" value="$(arg incremental_2D_projection)"/>
     <!-- z∈[0.2,0.8]（2026-08-24 随 res=0.2 联动，用户原始偏好在 0.2 格下达成）：
          免疫规则不变——min_z ≥ 一个整格。res=0.2 体素中心层 0.1/0.3/0.5/0.7…，
          地面端点(z≈0)落中心 0.1 层，0.1+0.1=0.2 > 0.2 恒假 → 地面/庭院回波
@@ -97,6 +118,11 @@
     <param name="sensor_model/max" type="double" value="0.97"/>
     <param name="sensor_model/min" type="double" value="0.12"/>
   </node>
+  <!-- Visualization only: keep OctoMap and projected_map at their configured
+       update rate, while limiting the blue occupied-cell MarkerArray to 1 Hz. -->
+  <node pkg="topic_tools" type="throttle" name="octomap_visualization_throttle"
+        args="messages /occupied_cells_vis_array_raw $(arg octomap_visualization_frequency) /occupied_cells_vis_array"/>
+  </group>
 
   <!-- rl_planner：scripts 为官方原版一字未改（含 checkpoint 权重）。
        其内部零 TF 查询，把 projected_map.origin 与位姿当裸数字混算——
@@ -107,6 +133,7 @@
          与上面建图用的 lidar_pose 分开接，各取所需。 -->
     <remap from="/state_estimation" to="/quad_0/body_pose"/>
     <param name="map_topic" value="$(arg map_topic)"/>
+    <param name="ground_z_ref" value="$(arg ground_z_ref)" type="double"/>
     <param name="publish_graph" type="bool" value="true"/>
     <param name="node_resolution" value="$(arg node_resolution)"/>
     <param name="sensor_range" value="$(arg planner_sensor_range)"/>

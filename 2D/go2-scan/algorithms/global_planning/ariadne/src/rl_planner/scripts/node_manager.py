@@ -193,6 +193,7 @@ class NodeManager:
 
     def get_rarefied_graph(self, robot_location, map_info):
         self.dist_to_nearest_frontier = 1e8
+        self.path_to_nearest_frontier = None
 
         t1 = time.time()
         # get all nodes with non-zero utility

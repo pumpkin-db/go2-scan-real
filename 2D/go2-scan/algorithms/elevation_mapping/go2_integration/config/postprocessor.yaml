@@ -1,0 +1,62 @@
+# Adapted from ANYbotics grid_map filters_demo_filter_chain.yaml.
+postprocessor_pipeline:
+  - name: buffer_normalizer
+    type: gridMapFilters/BufferNormalizerFilter
+
+  - name: mean_in_radius
+    type: gridMapFilters/MeanInRadiusFilter
+    params:
+      input_layer: elevation
+      output_layer: elevation_smooth
+      radius: 0.20
+
+  - name: surface_normals
+    type: gridMapFilters/NormalVectorsFilter
+    params:
+      input_layer: elevation_smooth
+      output_layers_prefix: normal_vectors_
+      radius: 0.25
+      normal_vector_positive_axis: z
+      algorithm: area
+      parallelization_enabled: false
+      thread_number: 1
+
+  - name: slope
+    type: gridMapFilters/MathExpressionFilter
+    params:
+      output_layer: slope
+      expression: acos(normal_vectors_z)
+
+  - name: roughness
+    type: gridMapFilters/MathExpressionFilter
+    params:
+      output_layer: roughness
+      expression: abs(elevation - elevation_smooth)
+
+  - name: traversability
+    type: gridMapFilters/MathExpressionFilter
+    params:
+      output_layer: traversability
+      expression: 0.5 * (1.0 - (slope / 0.35)) + 0.5 * (1.0 - (roughness / 0.08))
+
+  - name: traversability_lower_threshold
+    type: gridMapFilters/ThresholdFilter
+    params:
+      condition_layer: traversability
+      output_layer: traversability
+      lower_threshold: 0.0
+      set_to: 0.0
+
+  - name: traversability_upper_threshold
+    type: gridMapFilters/ThresholdFilter
+    params:
+      condition_layer: traversability
+      output_layer: traversability
+      upper_threshold: 1.0
+      set_to: 1.0
+
+  - name: occupancy
+    type: gridMapFilters/MathExpressionFilter
+    params:
+      output_layer: occupancy
+      expression: 1.0 - traversability

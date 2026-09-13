@@ -1,0 +1,33 @@
+<launch>
+  <arg name="config" default="$(find go2_elevation)/config/go2_mid360.yaml"/>
+  <arg name="postprocessor" default="$(find go2_elevation)/config/postprocessor.yaml"/>
+  <arg name="visualizations" default="$(find go2_elevation)/config/visualizations.yaml"/>
+
+  <!-- FAST-LIO publishes exact-time registered cloud/odometry pairs. -->
+  <node pkg="go2_elevation" type="fastlio_pose_covariance.py"
+        name="fastlio_elevation_pose" required="true" output="screen"/>
+  <node pkg="topic_tools" type="throttle" name="elevation_cloud_throttle"
+        args="messages /LIO/clouds_lidar 5.0 /elevation/input_cloud"/>
+
+  <!-- Load configuration in the node's private namespace.  elevation_mapping
+       reads ~input_sources and ~postprocessor_pipeline, not group parameters. -->
+  <node pkg="elevation_mapping" type="elevation_mapping"
+        name="elevation_mapping" required="true" output="screen">
+    <rosparam command="load" file="$(arg config)"/>
+    <rosparam command="load" file="$(arg postprocessor)"/>
+  </node>
+
+  <node pkg="grid_map_visualization" type="grid_map_visualization"
+        name="go2_elevation_visualization" required="true" output="screen">
+    <param name="grid_map_topic" value="/local_elevation_map"/>
+    <rosparam command="load" file="$(arg visualizations)"/>
+  </node>
+
+  <node pkg="go2_elevation" type="elevation_products.py"
+        name="go2_elevation_products" required="true" output="screen">
+    <param name="map_resolution" value="0.1"/>
+    <param name="global_resolution" value="0.2"/>
+    <param name="global_max_cells" value="100000"/>
+    <param name="global_publish_hz" value="0.5"/>
+  </node>
+</launch>

@@ -1,0 +1,9 @@
+uint8 ACTIVE=1
+uint8 SUCCEEDED=2
+uint8 FAILED=3
+std_msgs/Header request_header
+uint8 state
+string reason
+geometry_msgs/Point effective_goal
+int32 traj_id
+float64 distance_xy

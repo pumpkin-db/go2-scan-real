@@ -27,3 +27,5 @@ cd ~/Go2/2D/go2-scan/real
 ```
 
 Run `motion:=true` only with the physical Go2 connected and the test area safe.
+Both commands default to the tested fixed-height 2-D mode. The optional terrain
+mapping branch is started only when `elevation:=true` is supplied explicitly.

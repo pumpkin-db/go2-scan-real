@@ -5,14 +5,21 @@
   <arg name="navigation_mode" default="auto"/>
   <arg name="mode" default="prone"/>
   <arg name="rviz" default="false"/>
+  <arg name="elevation" default="false"/>
 
   <arg name="navi_mode" value="$(eval 3 if navigation_mode == 'auto' else 1)"/>
   <arg name="ar_planner" value="$(eval navigation_mode == 'auto')"/>
   <arg name="ground_z" value="$(eval -0.310 if mode == 'prone' else -0.565)"/>
   <arg name="ar_min_z" value="$(eval -0.110 if mode == 'prone' else -0.365)"/>
   <arg name="ar_max_z" value="$(eval 0.490 if mode == 'prone' else 0.235)"/>
+  <!-- FAST-LIO map origin is the IMU.  The calibrated body centre is 0.21697m
+       below it, so its height above ground follows directly from mode. -->
+  <arg name="body_ground_clearance" value="$(eval 0.09303 if mode == 'prone' else 0.34803)"/>
 
   <param name="use_sim_time" value="false"/>
+  <param name="/ariadne/execution_ready" value="false"/>
+  <param name="/rl_planner/goal_feedback" value="$(arg ar_planner)"/>
+  <param name="/scan_planner_node/fsm/goal_feedback" value="$(arg ar_planner)"/>
 
   <!-- NX owns this driver.  Board-side resident drivers are outside this graph. -->
   <param name="xfer_format" value="1"/>
@@ -53,6 +60,8 @@
     <param name="config" value="$(arg fastlio_config)"/>
   </node>
 
+  <include if="$(arg elevation)" file="$(find go2_elevation)/launch/go2_elevation.launch"/>
+
   <!-- AR-only input cleanup.  Height slicing happens in projected_map, not here. -->
   <node pkg="go2_bridge" type="cloud_range_filter.py" name="cloud_range_filter" required="true" output="screen">
     <param name="min_range" value="0.7"/>
@@ -62,6 +71,12 @@
     <param name="confirmation_window" value="1.0"/>
   </node>
 
+  <!-- Keep FAST-LIO and odometry at their native rates, but integrate LiDAR into
+       SCAN's 5 cm occupancy grid at 5 Hz.  Collision checking and control stay
+       at their original rates and always use the latest completed grid. -->
+  <node pkg="topic_tools" type="throttle" name="scan_cloud_throttle"
+        args="messages /LIO/clouds_lidar 5.0 /LIO/clouds_lidar_scan"/>
+
   <!-- SCAN official parameter file is included without parameter overrides. -->
   <param name="body_pose_topic" value="/LIO/odom_vehicle" type="str"/>
   <include file="$(find scan_planner)/launch/advanced_param.xml">
@@ -70,8 +85,10 @@
     <arg name="sensor_type" value="lidar"/>
     <arg name="body_pose_topic" value="/LIO/odom_vehicle"/>
     <arg name="sensor_pose_topic" value="/LIO/odom_imu"/>
-    <arg name="cloud_topic" value="/LIO/clouds_lidar"/>
+    <arg name="cloud_topic" value="/LIO/clouds_lidar_scan"/>
     <arg name="cloud_is_world" value="false"/>
+    <arg name="use_path_height" value="$(arg elevation)"/>
+    <arg name="body_height" value="$(arg body_ground_clearance)"/>
     <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw"/>
     <arg name="cx" value="317.19183349609375"/>
     <arg name="cy" value="256.4806823730469"/>
@@ -98,7 +115,7 @@
   <node pkg="go2_bridge" name="scan_cloud_accumulator" type="scan_cloud_accumulator.py" output="screen">
     <remap from="/mid360_points" to="/mid360_points_scanmap"/>
     <param name="voxel_size" value="0.20"/>
-    <param name="reset_interval" value="20.0"/>
+    <param name="reset_interval" value="5.0"/>
     <param name="max_range" value="40.0"/>
     <param name="save_dir" value="$(env HOME)/Go2/2D/go2-scan/real"/>
   </node>
@@ -106,21 +123,27 @@
   <!-- AR map is always present.  Only the automatic entry enables its planner. -->
   <include file="$(find rl_planner)/launch/go2_ariadne.launch">
     <arg name="map_topic" value="/projected_map"/>
+    <arg name="ground_z_ref" value="$(arg ground_z)"/>
     <arg name="map_resolution" value="0.1"/>
     <arg name="compress_map" value="false"/>
+    <arg name="incremental_2D_projection" value="false"/>
     <arg name="replanning_frequency" value="1.5"/>
     <arg name="map_update_frequency" value="2.0"/>
-    <arg name="sensor_range" value="6.0"/>
-    <arg name="planner_sensor_range" value="6.0"/>
+    <arg name="sensor_range" value="5.0"/>
+    <arg name="planner_sensor_range" value="5.0"/>
     <arg name="waypoint_update_min_interval" value="0.5"/>
     <arg name="occupancy_min_z" value="$(arg ar_min_z)"/>
     <arg name="occupancy_max_z" value="$(arg ar_max_z)"/>
     <arg name="projected_map_topic" value="/projected_map_occ"/>
     <arg name="filter_ground" value="false"/>
     <arg name="use_planner" value="$(arg ar_planner)"/>
+    <arg name="use_map_builder" value="$(eval not arg('elevation'))"/>
+    <arg name="lock_mapping_z" value="$(eval not arg('elevation'))"/>
   </include>
 
-  <node pkg="go2_bridge" name="projected_map_ground" type="projected_map_ground.py" output="screen">
+  <!-- The default 2-D map stays at its configured ground height.  Z drift is
+       removed at the AR-only sensor scan boundary above. -->
+  <node unless="$(arg elevation)" pkg="go2_bridge" name="projected_map_ground" type="projected_map_ground.py" output="screen">
     <param name="ground_z" value="$(arg ground_z)" type="double"/>
     <param name="in_topic" value="/projected_map_occ"/>
     <param name="out_topic" value="/projected_map"/>
@@ -129,8 +152,16 @@
   <group if="$(arg ar_planner)">
     <node pkg="go2_bridge" name="ariadne_goal_bridge" type="ariadne_goal_bridge.py" required="true" output="screen">
       <param name="repub_dist" value="0.5"/>
-      <param name="target_min_clearance" value="0.25"/>
-      <param name="target_search_radius" value="3.0"/>
+      <param name="target_min_clearance" value="0.40"/>
+      <param name="target_min_robot_distance" value="0.80"/>
+      <param name="target_search_radius" value="5.0"/>
+      <param name="use_elevation" value="$(arg elevation)"/>
+      <param name="elevation_cloud_topic" value="/local_elevation_cloud"/>
+      <param name="elevation_max_distance" value="0.20"/>
+      <param name="body_pose_topic" value="/LIO/odom_vehicle"/>
+      <param name="goal_feedback" value="true"/>
+      <param name="no_command_timeout" value="6.0"/>
+      <param name="motion_enabled" value="$(eval mode == 'stand')"/>
       <param name="floor_z_ref" value="$(arg ground_z)"/>
     </node>
   </group>
