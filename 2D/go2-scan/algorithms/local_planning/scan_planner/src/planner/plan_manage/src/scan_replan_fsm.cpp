@@ -23,9 +23,72 @@ namespace
 namespace scan_planner
 {
 
+  double SCANReplanFSM::monotonicNow()
+  {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  void SCANReplanFSM::finishGoal(uint8_t state, const std::string &reason)
+  {
+    if (!goal_tracking_) return;
+    goal_feedback_.state = state;
+    goal_feedback_.reason = reason;
+    goal_feedback_.traj_id = planner_manager_->local_data_.traj_id_;
+    goal_feedback_.effective_goal.x = end_pt_.x();
+    goal_feedback_.effective_goal.y = end_pt_.y();
+    goal_feedback_.effective_goal.z = end_pt_.z();
+    goal_feedback_.distance_xy = (end_pt_ - odom_pos_).head<2>().norm();
+    goal_tracking_ = false;
+    have_target_ = have_new_target_ = false;
+    replan_fail_count_ = 0;
+    // Preserve the existing emergency-stop state; otherwise abandon the old reference.
+    if (exec_state_ != EMERGENCY_STOP) changeFSMExecState(WAIT_TARGET, "GOAL_RESULT");
+    else need_hover_stop_ = true;
+    std_msgs::Int32 stop;
+    stop.data = goal_feedback_.traj_id;
+    stop_traj_pub_.publish(stop);
+    goal_feedback_pub_.publish(goal_feedback_);
+    ROS_INFO("[SCAN_GOAL] stamp=%.9f state=%u reason=%s distance=%.3f",
+             goal_feedback_.request_header.stamp.toSec(), state, reason.c_str(), goal_feedback_.distance_xy);
+  }
+
+  void SCANReplanFSM::goalTick(const ros::WallTimerEvent &)
+  {
+    if (goal_feedback_.request_header.stamp.isZero()) return;
+    const double now = monotonicNow();
+    if (goal_tracking_)
+    {
+      goal_feedback_.effective_goal.x = end_pt_.x();
+      goal_feedback_.effective_goal.y = end_pt_.y();
+      goal_feedback_.effective_goal.z = end_pt_.z();
+      goal_feedback_.distance_xy = (end_pt_ - odom_pos_).head<2>().norm();
+      goal_feedback_.traj_id = planner_manager_->local_data_.traj_id_;
+      // Arrival depends only on XY distance to the effective goal.
+      if (goal_feedback_.distance_xy < finish_distance_)
+      {
+        finishGoal(scan_planner::GoalFeedback::SUCCEEDED, "REACHED");
+        return;
+      }
+
+      if (now - odom_received_ < 0.5 && now - finished_received_ < 0.5 &&
+          finished_traj_ == goal_feedback_.traj_id && exec_state_ == WAIT_TARGET &&
+          goal_feedback_.distance_xy >= finish_distance_)
+        finishGoal(scan_planner::GoalFeedback::FAILED, "END_NOT_REACHED");
+    }
+    else
+    {
+      std_msgs::Int32 stop;
+      stop.data = goal_feedback_.traj_id;
+      stop_traj_pub_.publish(stop);
+    }
+    goal_feedback_pub_.publish(goal_feedback_);
+  }
+
   void SCANReplanFSM::init(ros::NodeHandle &nh)
   {
     current_wp_ = 0;
+    end_pt_.setZero();
+    odom_pos_.setZero();
     exec_state_ = FSM_EXEC_STATE::INIT;
     trigger_ = false;
     have_target_ = false;
@@ -46,6 +109,22 @@ namespace scan_planner
     nh.param("fsm/emergency_time_", emergency_time_, 1.0);
     nh.param("fsm/fail_safe", enable_fail_safe_, true);
     nh.param("fsm/max_replan_fail_count", max_replan_fail_count_, 1000);
+    nh.param("fsm/goal_feedback", feedback_enabled_, false);
+    nh.param("fsm/use_path_height", use_path_height_, false);
+    ros::param::param("/closed_loop_controller/finish_dist", finish_distance_, 0.6);
+    if (feedback_enabled_)
+    {
+      goal_feedback_pub_ = nh.advertise<scan_planner::GoalFeedback>("/scan/goal_feedback", 10);
+      stop_traj_pub_ = nh.advertise<std_msgs::Int32>("/planning/stop_trajectory", 10);
+      controller_done_sub_ = nh.subscribe<std_msgs::Int32>("/planning/finished_trajectory", 10,
+          [this](const std_msgs::Int32::ConstPtr &m) { finished_traj_ = m->data; finished_received_ = monotonicNow(); });
+      cancel_goal_sub_ = nh.subscribe<std_msgs::Time>("/scan/cancel_goal", 10,
+          [this](const std_msgs::Time::ConstPtr &m) {
+            if (goal_tracking_ && m->data == goal_feedback_.request_header.stamp)
+              finishGoal(scan_planner::GoalFeedback::FAILED, "CANCELED");
+          });
+      goal_timer_ = nh.createWallTimer(ros::WallDuration(0.1), &SCANReplanFSM::goalTick, this);
+    }
     nh.param("grid_map/obstacles_inflation_z_up", self_inflation_z_up_, 0.0);
     nh.param("grid_map/obstacles_inflation_z_down", self_inflation_z_down_, 0.0);
     nh.param("grid_map/double_cylinder_radius", self_double_cylinder_radius_, 0.0);
@@ -173,7 +252,11 @@ namespace scan_planner
     init_pt_ = odom_pos_;
 
     bool success = false;
-    end_pt_ << msg->poses[0].pose.position.x, msg->poses[0].pose.position.y, rviz_goal_height_;
+    // A 2-D goal uses the body centre height at the moment it is accepted.
+    // Holding this value for the goal avoids both stale startup height and
+    // mid-goal Z drift changing the planned trajectory.
+    const double goal_z = std::isfinite(odom_pos_(2)) ? odom_pos_(2) : rviz_goal_height_;
+    end_pt_ << msg->poses[0].pose.position.x, msg->poses[0].pose.position.y, goal_z;
     success = planner_manager_->planGlobalTraj(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), end_pt_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
     if (success)
@@ -356,6 +439,32 @@ namespace scan_planner
 
   void SCANReplanFSM::pathCallback(const nav_msgs::PathConstPtr &msg)
   {
+    if (feedback_enabled_ && msg && !msg->header.stamp.isZero())
+    {
+      if (msg->header.stamp <= goal_feedback_.request_header.stamp)
+      {
+        goal_feedback_pub_.publish(goal_feedback_);
+        return;
+      }
+      if (goal_tracking_) finishGoal(scan_planner::GoalFeedback::FAILED, "REPLACED");
+      goal_feedback_ = scan_planner::GoalFeedback();
+      goal_feedback_.request_header = msg->header;
+      goal_feedback_.state = scan_planner::GoalFeedback::ACTIVE;
+      goal_tracking_ = true;
+      fail_since_ = reached_since_ = 0;
+      finished_traj_ = -1;
+      if (msg->poses.size() < 2 || !have_odom_ || msg->header.frame_id != "world")
+      {
+        finishGoal(scan_planner::GoalFeedback::FAILED, "INVALID_OR_NOT_READY");
+        return;
+      }
+      for (const auto &p : msg->poses)
+        if (!std::isfinite(p.pose.position.x) || !std::isfinite(p.pose.position.y) || !std::isfinite(p.pose.position.z))
+        {
+          finishGoal(scan_planner::GoalFeedback::FAILED, "INVALID_TARGET");
+          return;
+        }
+    }
     if (!msg || msg->poses.empty())
     {
       ROS_WARN_THROTTLE(1.0, "[pathCallback] Received empty /initial_path, ignore.");
@@ -369,9 +478,16 @@ namespace scan_planner
     }
 
     trigger_ = true;
+    // In fixed 2-D mode, sample body-centre Z once when each goal arrives and
+    // hold it for that goal.  Elevation mode receives ground Z in the path and
+    // adds the configured body-to-ground height.
+    const double fixed_goal_z = std::isfinite(odom_pos_(2)) ? odom_pos_(2) : rviz_goal_height_;
+    const auto goalHeight = [this, fixed_goal_z](double path_z) {
+      return use_path_height_ ? path_z + body_height_ : fixed_goal_z;
+    };
     end_pt_ << msg->poses.back().pose.position.x,
         msg->poses.back().pose.position.y,
-        msg->poses.back().pose.position.z + body_height_;
+        goalHeight(msg->poses.back().pose.position.z);
 
     std::vector<Eigen::Vector3d> waypoints;
     waypoints.reserve(msg->poses.size());
@@ -384,7 +500,7 @@ namespace scan_planner
       Eigen::Vector3d wp;
       wp(0) = pose_stamped.pose.position.x;
       wp(1) = pose_stamped.pose.position.y;
-      wp(2) = pose_stamped.pose.position.z + body_height_;
+      wp(2) = goalHeight(pose_stamped.pose.position.z);
 
       if (first || (wp - last_wp).norm() >= min_dist)
       {
@@ -416,20 +532,23 @@ namespace scan_planner
     else
     {
       ROS_ERROR("❌ Unable to generate global trajectory!");
+      if (goal_tracking_) finishGoal(scan_planner::GoalFeedback::FAILED, "GLOBAL_PLAN_FAILED");
     }
   }
 
   void SCANReplanFSM::odometryCallback(const nav_msgs::OdometryConstPtr &msg)
   {
+    if (std::isfinite(msg->pose.pose.position.x) && std::isfinite(msg->pose.pose.position.y))
+      odom_received_ = monotonicNow();
     odom_pos_(0) = msg->pose.pose.position.x;
     odom_pos_(1) = msg->pose.pose.position.y;
     odom_pos_(2) = msg->pose.pose.position.z;
 
-    if (navi_mode_ == NAVI_MODE::MANUAL_TARGET && !rviz_height_ready_)
+    if (!rviz_height_ready_)
     {
       rviz_goal_height_ = odom_pos_(2);
       rviz_height_ready_ = true;
-      ROS_INFO("[SCANReplanFSM] Set RViz goal height from initial body_pose z: %.3f", rviz_goal_height_);
+      ROS_INFO("[SCANReplanFSM] Set goal height from initial body center z: %.3f", rviz_goal_height_);
     }
 
     odom_vel_(0) = msg->twist.twist.linear.x;
@@ -744,8 +863,23 @@ namespace scan_planner
 
   void SCANReplanFSM::finishProcess()
   {
+    if (goal_tracking_)
+    {
+      if (replan_fail_count_ == 0) fail_since_ = 0;
+      else if (fail_since_ == 0) fail_since_ = monotonicNow();
+      else if (monotonicNow() - fail_since_ >= 5.0)
+      {
+        finishGoal(scan_planner::GoalFeedback::FAILED, "LOCAL_PLAN_TIMEOUT");
+        return;
+      }
+    }
     if (replan_fail_count_ >= max_replan_fail_count_)
     {
+      if (goal_tracking_)
+      {
+        finishGoal(scan_planner::GoalFeedback::FAILED, "LOCAL_PLAN_FAILED");
+        return;
+      }
       ROS_WARN("Replan failed %d times. Emergency stop and wait for a new target.", replan_fail_count_);
       replan_fail_count_ = 0;
       need_hover_stop_ = true;

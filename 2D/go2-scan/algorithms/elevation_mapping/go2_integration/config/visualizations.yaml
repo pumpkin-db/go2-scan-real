@@ -1,0 +1,12 @@
+grid_map_visualizations:
+  - name: /local_elevation_cloud
+    type: point_cloud
+    params:
+      layer: elevation
+
+  - name: /local_traversability_map
+    type: occupancy_grid
+    params:
+      layer: occupancy
+      data_min: 0.0
+      data_max: 1.0

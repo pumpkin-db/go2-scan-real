@@ -90,7 +90,7 @@ Visualization Manager:
       Queue Size: 10
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.75
+      Size (m): 0.6000000238418579
       Style: Spheres
       Topic: /node
       Unreliable: false
@@ -104,7 +104,7 @@ Visualization Manager:
       History Length: 1
       Name: Waypoint
       Queue Size: 10
-      Radius: 0.800000011920929
+      Radius: 0.5
       Topic: /way_point
       Unreliable: false
       Value: true

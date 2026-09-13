@@ -1,0 +1,365 @@
+/**********************************************************************
+ * Software License Agreement (BSD License)
+ *
+ * Copyright (c) 2024, ANYbotics
+ * All rights reserved.
+ *
+ *  Redistribution and use in source and binary forms, with or without
+ *  modification, are permitted provided that the following conditions
+ *  are met:
+ *
+ *   * Redistributions of source code must retain the above copyright
+ *     notice, this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above
+ *     copyright notice, this list of conditions and the following
+ *     disclaimer in the documentation and/or other materials provided
+ *     with the distribution.
+ *   * Neither the name of Autonomous Systems Lab nor ETH Zurich
+ *     nor the names of its contributors may be used to endorse or
+ *     promote products derived from this software without specific
+ *     prior written permission.
+ *
+ *  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ *  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ *  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ *  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ *  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ *  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ *  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ *  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ *  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ *  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ *  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ *  POSSIBILITY OF SUCH DAMAGE.
+ */
+/*!
+ * @file     log_messages_ros2.hpp
+ * @author   ANYbotics
+ * @date     2024
+ * @brief
+ */
+
+#pragma once
+
+#include <atomic>
+#include <mutex>
+
+#include <rclcpp/rclcpp.hpp>
+
+#include "message_logger/log/log_messages_backend.hpp"
+
+namespace message_logger {
+namespace log {
+
+//! Logger name used until a node claims MELO logging; it names itself in console output.
+constexpr const char* kUnattachedLoggerName{"message_logger"};
+
+/*!
+ * Holds the rclcpp::Logger the MELO_* macros log through.
+ *
+ * rcl publishes a record to /rosout only under a logger name rclcpp::Node registered, so records
+ * logged through the unattached logger reach the console but never /rosout, and so never a bag.
+ * Nodes claim MELO logging with attachToNode().
+ *
+ * Keep the state inline. A function-local static in an inline function is a STB_GNU_UNIQUE
+ * symbol, so every object in the process shares one instance. A static inside the library cannot
+ * unify with the copies already compiled into installed libraries, and the loader then binds
+ * getLogger() and setLogger() to different ones: attachToNode() writes a logger nobody reads.
+ */
+class LoggerManager {
+ public:
+  static rclcpp::Logger& getLogger() {
+    warnOnceIfUnattached();
+    return loggerStorage();
+  }
+
+  static void setLogger(const rclcpp::Logger& logger) {
+    loggerStorage() = logger;
+    attached().store(true, std::memory_order_relaxed);
+  }
+
+  //! False until a node claims MELO logging; until then records cannot reach /rosout.
+  static bool isAttached() { return attached().load(std::memory_order_relaxed); }
+
+ private:
+  static rclcpp::Logger& loggerStorage() {
+    static rclcpp::Logger logger = rclcpp::get_logger(kUnattachedLoggerName);
+    return logger;
+  }
+
+  static std::atomic<bool>& attached() {
+    static std::atomic<bool> attached{false};
+    return attached;
+  }
+
+  //! Announce the loss once, on the console the lost records go to.
+  static void warnOnceIfUnattached() {
+    if (isAttached()) {
+      return;
+    }
+    static std::once_flag warned;
+    std::call_once(warned, [] {
+      RCLCPP_WARN(loggerStorage(),
+                  "message_logger is not attached to a node: MELO_* records reach the console only "
+                  "and are missing from /rosout and from every recorded bag. Call "
+                  "message_logger::log::attachToNode(node) right after creating the node.");
+    });
+  }
+};
+
+// Clock management
+class LoggerClockManager {
+ public:
+  static rclcpp::Clock& getLoggerClock() {
+    static rclcpp::Clock loggerClock(RCL_ROS_TIME);
+    return loggerClock;
+  }
+
+  static void setClock(const rclcpp::Clock& clock) { getLoggerClock() = clock; }
+};
+
+/*!
+ * Route the MELO_* macros through `node`: its logger puts records on /rosout under the node's
+ * name, its clock makes MELO_*_THROTTLE follow ROS time under use_sim_time. Call as soon as the
+ * node exists — records emitted before it are lost to /rosout.
+ */
+inline void attachToNode(rclcpp::Node& node) {
+  LoggerManager::setLogger(node.get_logger());
+  LoggerClockManager::setClock(*node.get_clock());
+}
+
+inline void attachToNode(const rclcpp::Node::SharedPtr& node) {
+  attachToNode(*node);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#define MELO_LOG(level, ...)                                                                                                             \
+  {                                                                                                                                      \
+    auto& logger = message_logger::log::LoggerManager::getLogger();                                                                      \
+    std::stringstream melo_stringstream;                                                                                                 \
+    melo_stringstream << message_logger::log::parseMemberName(__PRETTY_FUNCTION__) << message_logger::log::getLogColor(level)            \
+                      << message_logger::common::internal::meloStringFormat(__VA_ARGS__) << message_logger::log::getResetColor();        \
+    switch (level) {                                                                                                                     \
+      case message_logger::log::levels::Debug: {                                                                                         \
+        RCLCPP_DEBUG(logger, "%s", melo_stringstream.str().c_str());                                                                     \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Info: {                                                                                          \
+        RCLCPP_INFO(logger, "%s", melo_stringstream.str().c_str());                                                                      \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Warn: {                                                                                          \
+        RCLCPP_WARN(logger, "%s", melo_stringstream.str().c_str());                                                                      \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Error: {                                                                                         \
+        RCLCPP_ERROR(logger, "%s", melo_stringstream.str().c_str());                                                                     \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Fatal: {                                                                                         \
+        RCLCPP_FATAL(logger, "%s", melo_stringstream.str().c_str());                                                                     \
+        std::stringstream melo_assert_stringstream;                                                                                      \
+        melo_assert_stringstream << message_logger::log::colorFatal << message_logger::common::internal::meloStringFormat(__VA_ARGS__)   \
+                                 << message_logger::log::getResetColor();                                                                \
+        message_logger::common::internal::meloThrowException<message_logger::log::melo_fatal>("[FATAL] ", __FUNCTION__, __FILE__,        \
+                                                                                              __LINE__, melo_assert_stringstream.str()); \
+      } break;                                                                                                                           \
+      default: {                                                                                                                         \
+        RCLCPP_INFO(logger, __VA_ARGS__);                                                                                                \
+      } break;                                                                                                                           \
+    }                                                                                                                                    \
+  }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#define MELO_LOG_STREAM(level, message)                                                                                                  \
+  {                                                                                                                                      \
+    auto& logger = message_logger::log::LoggerManager::getLogger();                                                                      \
+    std::stringstream melo_stringstream;                                                                                                 \
+    /* NOLINTNEXTLINE(bugprone-macro-parentheses) */                                                                                     \
+    melo_stringstream << message_logger::log::parseMemberName(__PRETTY_FUNCTION__) << message_logger::log::getLogColor(level) << message \
+                      << message_logger::log::getResetColor();                                                                           \
+    switch (level) {                                                                                                                     \
+      case message_logger::log::levels::Debug: {                                                                                         \
+        RCLCPP_DEBUG_STREAM(logger, melo_stringstream.str());                                                                            \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Info: {                                                                                          \
+        RCLCPP_INFO_STREAM(logger, melo_stringstream.str());                                                                             \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Warn: {                                                                                          \
+        RCLCPP_WARN_STREAM(logger, melo_stringstream.str());                                                                             \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Error: {                                                                                         \
+        RCLCPP_ERROR_STREAM(logger, melo_stringstream.str());                                                                            \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Fatal: {                                                                                         \
+        RCLCPP_FATAL_STREAM(logger, melo_stringstream.str());                                                                            \
+        std::stringstream melo_assert_stringstream;                                                                                      \
+        /* NOLINTNEXTLINE(bugprone-macro-parentheses) */                                                                                 \
+        melo_assert_stringstream << message_logger::log::colorFatal << message << message_logger::log::getResetColor();                  \
+        message_logger::common::internal::meloThrowException<message_logger::log::melo_fatal>("[FATAL] ", __FUNCTION__, __FILE__,        \
+                                                                                              __LINE__, melo_assert_stringstream.str()); \
+      } break;                                                                                                                           \
+      default: {                                                                                                                         \
+        RCLCPP_INFO_STREAM(logger, message);                                                                                             \
+      } break;                                                                                                                           \
+    }                                                                                                                                    \
+  }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#define MELO_LOG_FP(level, ...) MELO_LOG(level, __VA_ARGS__)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#define MELO_LOG_STREAM_FP(level, message) MELO_LOG_STREAM(level, message)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#define MELO_LOG_ONCE(level, ...)                                                                                                        \
+  {                                                                                                                                      \
+    auto& logger = message_logger::log::LoggerManager::getLogger();                                                                      \
+    std::stringstream melo_stringstream;                                                                                                 \
+    melo_stringstream << message_logger::log::parseMemberName(__PRETTY_FUNCTION__) << message_logger::log::getLogColor(level)            \
+                      << message_logger::common::internal::meloStringFormat(__VA_ARGS__) << message_logger::log::getResetColor();        \
+    switch (level) {                                                                                                                     \
+      case message_logger::log::levels::Debug: {                                                                                         \
+        RCLCPP_DEBUG_ONCE(logger, "%s", melo_stringstream.str().c_str());                                                                \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Info: {                                                                                          \
+        RCLCPP_INFO_ONCE(logger, "%s", melo_stringstream.str().c_str());                                                                 \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Warn: {                                                                                          \
+        RCLCPP_WARN_ONCE(logger, "%s", melo_stringstream.str().c_str());                                                                 \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Error: {                                                                                         \
+        RCLCPP_ERROR_ONCE(logger, "%s", melo_stringstream.str().c_str());                                                                \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Fatal: {                                                                                         \
+        RCLCPP_FATAL_ONCE(logger, "%s", melo_stringstream.str().c_str());                                                                \
+        std::stringstream melo_assert_stringstream;                                                                                      \
+        melo_assert_stringstream << message_logger::log::colorFatal << message_logger::common::internal::meloStringFormat(__VA_ARGS__)   \
+                                 << message_logger::log::getResetColor();                                                                \
+        message_logger::common::internal::meloThrowException<message_logger::log::melo_fatal>("[FATAL] ", __FUNCTION__, __FILE__,        \
+                                                                                              __LINE__, melo_assert_stringstream.str()); \
+      } break;                                                                                                                           \
+      default: {                                                                                                                         \
+        RCLCPP_INFO_ONCE(logger, __VA_ARGS__);                                                                                           \
+      } break;                                                                                                                           \
+    }                                                                                                                                    \
+  }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#define MELO_LOG_STREAM_ONCE(level, message)                                                                                             \
+  {                                                                                                                                      \
+    auto& logger = message_logger::log::LoggerManager::getLogger();                                                                      \
+    std::stringstream melo_stringstream;                                                                                                 \
+    /* NOLINTNEXTLINE(bugprone-macro-parentheses) */                                                                                     \
+    melo_stringstream << message_logger::log::parseMemberName(__PRETTY_FUNCTION__) << message_logger::log::getLogColor(level) << message \
+                      << message_logger::log::getResetColor();                                                                           \
+    switch (level) {                                                                                                                     \
+      case message_logger::log::levels::Debug: {                                                                                         \
+        RCLCPP_DEBUG_STREAM_ONCE(logger, melo_stringstream.str());                                                                       \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Info: {                                                                                          \
+        RCLCPP_INFO_STREAM_ONCE(logger, melo_stringstream.str());                                                                        \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Warn: {                                                                                          \
+        RCLCPP_WARN_STREAM_ONCE(logger, melo_stringstream.str());                                                                        \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Error: {                                                                                         \
+        RCLCPP_ERROR_STREAM_ONCE(logger, melo_stringstream.str());                                                                       \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Fatal: {                                                                                         \
+        RCLCPP_FATAL_STREAM_ONCE(logger, melo_stringstream.str());                                                                       \
+        std::stringstream melo_assert_stringstream;                                                                                      \
+        /* NOLINTNEXTLINE(bugprone-macro-parentheses) */                                                                                 \
+        melo_assert_stringstream << message_logger::log::colorFatal << message << message_logger::log::getResetColor();                  \
+        message_logger::common::internal::meloThrowException<message_logger::log::melo_fatal>("[FATAL] ", __FUNCTION__, __FILE__,        \
+                                                                                              __LINE__, melo_assert_stringstream.str()); \
+      } break;                                                                                                                           \
+      default: {                                                                                                                         \
+        RCLCPP_INFO_STREAM_ONCE(logger, message);                                                                                        \
+      } break;                                                                                                                           \
+    }                                                                                                                                    \
+  }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/**
+ * @brief Log a message with throttling (rate limiting)
+ * @param rate Throttle rate in seconds (e.g., 1.0 for once per second, 0.5 for twice per second)
+ * @param level Log level (Debug, Info, Warn, Error, Fatal)
+ * @param ... Variable arguments for message formatting
+ */
+#define MELO_LOG_THROTTLE(rate, level, ...)                                                                                              \
+  {                                                                                                                                      \
+    uint32_t rate_ms = static_cast<uint32_t>(rate * 1000);                                                                               \
+    auto& logger = message_logger::log::LoggerManager::getLogger();                                                                      \
+    auto& clock = message_logger::log::LoggerClockManager::getLoggerClock();                                                             \
+    std::stringstream melo_stringstream;                                                                                                 \
+    melo_stringstream << message_logger::log::parseMemberName(__PRETTY_FUNCTION__) << message_logger::log::getLogColor(level)            \
+                      << message_logger::common::internal::meloStringFormat(__VA_ARGS__) << message_logger::log::getResetColor();        \
+    switch (level) {                                                                                                                     \
+      case message_logger::log::levels::Debug: {                                                                                         \
+        RCLCPP_DEBUG_THROTTLE(logger, clock, rate_ms, "%s", melo_stringstream.str().c_str());                                            \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Info: {                                                                                          \
+        RCLCPP_INFO_THROTTLE(logger, clock, rate_ms, "%s", melo_stringstream.str().c_str());                                             \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Warn: {                                                                                          \
+        RCLCPP_WARN_THROTTLE(logger, clock, rate_ms, "%s", melo_stringstream.str().c_str());                                             \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Error: {                                                                                         \
+        RCLCPP_ERROR_THROTTLE(logger, clock, rate_ms, "%s", melo_stringstream.str().c_str());                                            \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Fatal: {                                                                                         \
+        RCLCPP_FATAL_THROTTLE(logger, clock, rate_ms, "%s", melo_stringstream.str().c_str());                                            \
+        std::stringstream melo_assert_stringstream;                                                                                      \
+        melo_assert_stringstream << message_logger::log::colorFatal << message_logger::common::internal::meloStringFormat(__VA_ARGS__)   \
+                                 << message_logger::log::getResetColor();                                                                \
+        message_logger::common::internal::meloThrowException<message_logger::log::melo_fatal>("[FATAL] ", __FUNCTION__, __FILE__,        \
+                                                                                              __LINE__, melo_assert_stringstream.str()); \
+      } break;                                                                                                                           \
+      default: {                                                                                                                         \
+        RCLCPP_INFO_THROTTLE(logger, clock, rate_ms, __VA_ARGS__);                                                                       \
+      } break;                                                                                                                           \
+    }                                                                                                                                    \
+  }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/**
+ * @brief Log a stream message with throttling (rate limiting)
+ * @param rate Throttle rate in seconds (e.g., 1.0 for once per second, 0.5 for twice per second)
+ * @param level Log level (Debug, Info, Warn, Error, Fatal)
+ * @param message Message to log
+ */
+#define MELO_LOG_THROTTLE_STREAM(rate, level, message)                                                                                   \
+  {                                                                                                                                      \
+    uint32_t rate_ms = static_cast<uint32_t>(rate * 1000);                                                                               \
+    auto& logger = message_logger::log::LoggerManager::getLogger();                                                                      \
+    auto& clock = message_logger::log::LoggerClockManager::getLoggerClock();                                                             \
+    std::stringstream melo_stringstream;                                                                                                 \
+    /* NOLINTNEXTLINE(bugprone-macro-parentheses) */                                                                                     \
+    melo_stringstream << message_logger::log::parseMemberName(__PRETTY_FUNCTION__) << message_logger::log::getLogColor(level) << message \
+                      << message_logger::log::getResetColor();                                                                           \
+    switch (level) {                                                                                                                     \
+      case message_logger::log::levels::Debug: {                                                                                         \
+        RCLCPP_DEBUG_STREAM_THROTTLE(logger, clock, rate_ms, melo_stringstream.str());                                                   \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Info: {                                                                                          \
+        RCLCPP_INFO_STREAM_THROTTLE(logger, clock, rate_ms, melo_stringstream.str());                                                    \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Warn: {                                                                                          \
+        RCLCPP_WARN_STREAM_THROTTLE(logger, clock, rate_ms, melo_stringstream.str());                                                    \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Error: {                                                                                         \
+        RCLCPP_ERROR_STREAM_THROTTLE(logger, clock, rate_ms, melo_stringstream.str());                                                   \
+      } break;                                                                                                                           \
+      case message_logger::log::levels::Fatal: {                                                                                         \
+        RCLCPP_FATAL_STREAM_THROTTLE(logger, clock, rate_ms, melo_stringstream.str());                                                   \
+        std::stringstream melo_assert_stringstream;                                                                                      \
+        /* NOLINTNEXTLINE(bugprone-macro-parentheses) */                                                                                 \
+        melo_assert_stringstream << message_logger::log::colorFatal << message << message_logger::log::getResetColor();                  \
+        message_logger::common::internal::meloThrowException<message_logger::log::melo_fatal>("[FATAL] ", __FUNCTION__, __FILE__,        \
+                                                                                              __LINE__, melo_assert_stringstream.str()); \
+      } break;                                                                                                                           \
+      default: {                                                                                                                         \
+        RCLCPP_INFO_STREAM_THROTTLE(logger, clock, rate_ms, message);                                                                    \
+      } break;                                                                                                                           \
+    }                                                                                                                                    \
+  }
+
+}  // namespace log
+}  // namespace message_logger

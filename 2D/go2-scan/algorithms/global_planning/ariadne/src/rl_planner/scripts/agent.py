@@ -236,7 +236,8 @@ class Agent:
         edge_padding_mask[0, 0, curren_in_edge] = 1
         return node_inputs, None, edge_mask, next_node_index, next_edge, edge_padding_mask
 
-    def select_next_waypoint(self, observation, greedy=True, excluded_positions=None):
+    def select_next_waypoint(self, observation, greedy=True, excluded_positions=None,
+                             position_penalty=None):
         _, _, _, _, current_edge, _ = observation
         with torch.no_grad():
             logp = self.policy_net(*observation)
@@ -249,10 +250,24 @@ class Agent:
                 coords = tuple(self.key_node_coords[node_index.item()])
                 if coords in excluded_positions:
                     filtered_logp[0, action_index] = -float('inf')
-                elif torch.isfinite(logp[0, action_index]):
+                elif torch.isfinite(logp[0, action_index]) and logp[0, action_index] > -1e7:
                     unblocked_actions += 1
             if unblocked_actions:
                 logp = filtered_logp
+            else:
+                return None, None
+
+        # Never turn a masked self/invalid edge into a valid fallback action.
+        valid = torch.isfinite(logp) & (logp > -1e7)
+        if not torch.any(valid):
+            return None, None
+        logp = logp.clone()
+        logp[~valid] = -float('inf')
+        if position_penalty is not None:
+            for action_index, node_index in enumerate(current_edge[0, :, 0]):
+                if valid[0, action_index]:
+                    logp[0, action_index] -= position_penalty(
+                        self.key_node_coords[node_index.item()])
 
         if greedy:
             action_index = torch.argmax(logp, dim=1).long()

@@ -1,0 +1,45 @@
+robot_pose_with_covariance_topic: /elevation_mapping/pose
+robot_pose_cache_size: 200
+map_frame_id: map
+robot_base_frame_id: base_footprint
+track_point_frame_id: base
+track_point_x: 0.0
+track_point_y: 0.0
+track_point_z: 0.0
+
+# AR sees up to 5 m from the robot.  A 12 m rolling map keeps a 1 m margin.
+length_in_x: 12.0
+length_in_y: 12.0
+resolution: 0.1
+min_update_rate: 2.0
+fused_map_publishing_rate: 2.0
+visibility_cleanup_rate: 1.0
+relocate_rate: 2.0
+scanning_duration: 0.1
+enable_visibility_cleanup: true
+enable_continuous_cleanup: false
+postprocessor_num_threads: 1
+output_topic: /local_elevation_map
+postprocessor_pipeline_name: postprocessor_pipeline
+
+input_sources:
+  mid360:
+    type: pointcloud
+    topic: /elevation/input_cloud
+    queue_size: 1
+    publish_on_update: true
+    sensor_processor:
+      # Upstream elevation_mapping laser model, initially using its supplied
+      # Velodyne values until MID360 bag data supports a measured noise model.
+      type: laser
+      min_radius: 0.018
+      beam_angle: 0.0006
+      beam_constant: 0.0015
+      apply_voxelgrid_filter: true
+      voxelgrid_filter_size: 0.1
+      ignore_points_below: -1.0
+      ignore_points_above: 1.5
+
+# Keep the official motion covariance update active.
+robot_motion_map_update:
+  covariance_scale: 1.0

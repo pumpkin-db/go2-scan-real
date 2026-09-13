@@ -9,5 +9,8 @@ local MID360/NX integration changes. Original licenses remain beside each tree.
 - Unitree SDK2: `unitreerobotics/unitree_sdk2` at `7a9ceca8e58c8b75fcf74a092826c138667ad698`
 - SCAN-Planner base: `wuyi2121/SCAN-Planner` at `348e8a590a50a5a6bbab8d8c6dcfd171f009be26`
 - go2-scan base: `pumpkin-db/go2-scan` at `d6f8fbb57da0cae488719fa5779068b1b6b68221`
+- elevation_mapping base: `ANYbotics/elevation_mapping` (vendored optional
+  `elevation:=true` source plus kindr/message-logger; ROS grid-map packages are
+  installed by `setup_nx.sh`)
 
 Point-LIO is intentionally excluded. The real stack uses NX-local FAST-LIO.

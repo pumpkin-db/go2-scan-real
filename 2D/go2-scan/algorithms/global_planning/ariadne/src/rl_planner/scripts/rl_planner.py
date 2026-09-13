@@ -9,7 +9,9 @@ import numpy as np
 import torch
 import os
 import time
-from std_msgs.msg import Bool, Float32, Header, Int32, String
+import json
+from collections import deque
+from std_msgs.msg import Bool, Float32, Float64, Header, Int32, String
 from nav_msgs.msg import OccupancyGrid, Path
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Point, PointStamped
@@ -17,6 +19,7 @@ from visualization_msgs.msg import Marker
 from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs import point_cloud2
 from agent import Agent
+from exploration_continuity import FrontierContinuity
 from model import PolicyNet
 from node_manager import NodeManager
 from utils import *
@@ -31,6 +34,16 @@ class Runner:
         self.paused = False
         self.reset_requested = False
         self.session_id = 1
+        self.goal_feedback_enabled = rospy.get_param('~goal_feedback', False)
+        self.pending_goal = None
+        self.goal_results = deque()
+        self.failed_until = {}
+        self.goal_stamp_ns = 0
+        self.continuity = FrontierContinuity()
+        if self.goal_feedback_enabled:
+            from scan_planner.msg import GoalFeedback
+            rospy.Subscriber('/ariadne/goal_feedback', GoalFeedback,
+                             lambda m: self.goal_results.append(m), queue_size=20)
 
         # visualization
         self.publish_graph = rospy.get_param('~publish_graph', True)
@@ -74,6 +87,9 @@ class Runner:
 
         # robot coordination wrt map frame
         self.robot_location = None
+        # All AR visualization geometry is drawn on the current floor plane.
+        # Fixed mode keeps the launch value; elevation mode publishes this value.
+        self.ground_z_ref = float(rospy.get_param('~ground_z_ref', 0.0))
 
         # the grid occupied by the robot
         self.robot_cell = None
@@ -113,6 +129,8 @@ class Runner:
         map_topic = rospy.get_param('~map_topic', '/projected_map')
         rospy.Subscriber(map_topic, OccupancyGrid, self.get_map_callback, queue_size=1)
         rospy.Subscriber('/state_estimation', Odometry, self.get_loc_callback, queue_size=1)
+        rospy.Subscriber('/floor_context/z_ref', Float64,
+                         self.floor_z_callback, queue_size=1)
         rospy.Subscriber('/scan/effective_goal', Path,
                          self.effective_goal_callback, queue_size=5)
 
@@ -123,6 +141,7 @@ class Runner:
         self.node_pub = rospy.Publisher('/node', PointCloud2, queue_size=1)
         self.frontier_pub = rospy.Publisher('/frontier', PointCloud2, queue_size=1)
         self.status_pub = rospy.Publisher('/ariadne/status', String, queue_size=1, latch=True)
+        self.diagnostic_pub = rospy.Publisher('/ariadne/diagnostic', String, queue_size=5)
         self.session_pub = rospy.Publisher('/ariadne/session_id', Int32, queue_size=1, latch=True)
         self.target_valid_pub = rospy.Publisher('/ariadne/target_valid', Bool, queue_size=1, latch=True)
         rospy.Subscriber('/ariadne/lifecycle/pause', Bool, self.pause_callback, queue_size=1)
@@ -175,6 +194,11 @@ class Runner:
         t2 = time.time()
         # print("process map using {}".format(t2 - t1))
 
+    def floor_z_callback(self, msg):
+        z = float(msg.data)
+        if np.isfinite(z):
+            self.ground_z_ref = z
+
     def get_loc_callback(self, msg):
         if self.map_info is None:
             return
@@ -209,6 +233,7 @@ class Runner:
         way_point.header.stamp = rospy.Time.now()
         way_point.point.x = loc[0]
         way_point.point.y = loc[1]
+        way_point.point.z = self.ground_z_ref
         return way_point
 
     def init_agent(self):
@@ -246,6 +271,10 @@ class Runner:
     def reset_for_floor(self):
         """Discard all decision/session state while retaining checkpoint and latest inputs."""
         self.init_agent()
+        self.pending_goal = None
+        self.failed_until.clear()
+        self.continuity.reset()
+        self.goal_results.clear()
         self.step = 0
         self.start = None
         self.robot_cell = None
@@ -273,6 +302,12 @@ class Runner:
         rospy.loginfo('[ariadne] reset for floor: session=%d', self.session_id)
 
     def publish_waypoint(self, waypoint):
+        if self.goal_feedback_enabled:
+            if self.pending_goal is not None: return
+            ns = max(rospy.Time.now().to_nsec(), self.goal_stamp_ns + 1)
+            self.goal_stamp_ns = ns
+            waypoint.header.stamp = rospy.Time(ns // 1000000000, ns % 1000000000)
+            self.pending_goal = waypoint
         self.waypoint_pub.publish(waypoint)
         self.target_valid_pub.publish(Bool(True))
         self._last_waypoint_publish_time = time.time()
@@ -311,8 +346,13 @@ class Runner:
         self._stop_state['t'] = now
         util_pos = -1
         valid = -1
+        frontier_count = -1
         try:
             util_pos = int(sum(1 for u in self.robot.key_utility if u > 0))
+        except Exception:
+            pass
+        try:
+            frontier_count = len(self.robot.frontier)
         except Exception:
             pass
         try:
@@ -323,6 +363,15 @@ class Runner:
         except Exception:
             valid = -2
         try:
+            diagnostic = dict(reason=reason, util_pos=util_pos,
+                              valid_actions=valid, frontiers=getattr(self, "_global_frontier_count", frontier_count),
+                              blocked=len(self.policy_blocked_nodes),
+                              stalled=now - self._last_map_change_time,
+                              done_reason=self._done_reason,
+                              escape_mode=self.escape_mode,
+                              escape_arrived=self.escape_arrived,
+                              excluded=len(self.escape_excluded_nodes))
+            self.diagnostic_pub.publish(String(json.dumps(diagnostic, ensure_ascii=False)))
             rospy.loginfo(
                 "STOP_REASON=%s util_pos=%d valid_actions=%d blocked=%d "
                 "stalled=%.1fs stall_done=%s escape_mode=%s escape_arrived=%s excluded=%d",
@@ -332,8 +381,87 @@ class Runner:
         except Exception:
             pass
 
+    def update_planning_graph(self):
+        """Refresh perception without selecting or replacing an execution goal."""
+        self.robot.node_manager.check_valid_node(self.robot_location, self.map_info)
+        robot_node_location = self.robot_location
+        if not np.array_equal(self.robot_location, self.start):
+            if len(self.robot.node_manager.nodes_dict) == 0:
+                robot_node_location = self.start
+            else:
+                nearest = self.robot.node_manager.nodes_dict.nearest_neighbors(
+                    self.robot_location.tolist(), 1)[0]
+                robot_node_location = nearest.data.coords
+        self.robot.update_planning_state(self.map_info, robot_node_location)
+        return robot_node_location
+
+    def continuous_frontier_waypoint(self, proposed, frontiers):
+        """Select only after terminal SCAN feedback; never determine arrival."""
+        if not self.goal_feedback_enabled:
+            return proposed
+        decision_started = time.perf_counter()
+        map_info = self.map_info
+        def free(p):
+            cell = get_cell_position_from_coords(np.asarray(p), map_info)
+            return (0 <= cell[0] < map_info.map.shape[1] and
+                    0 <= cell[1] < map_info.map.shape[0] and
+                    map_info.map[cell[1], cell[0]] == parameter.FREE)
+        def clear(a, b):
+            return free(a) and free(b) and not check_collision(
+                np.asarray(a), np.asarray(b), map_info)
+        nodes = {tuple(e.data.coords): e.data
+                 for e in self.robot.node_manager.nodes_dict}
+        next_location = self.continuity.choose(
+            proposed, frontiers, nodes, self.robot.location,
+            self.robot_location, free, clear, self.policy_blocked_nodes,
+            time.monotonic(), int((map_info.map != parameter.UNKNOWN).sum()),
+            observation_range=parameter.UTILITY_RANGE,
+            waypoint_range=parameter.THR_NEXT_WAYPOINT + parameter.NODE_RESOLUTION)
+        self.diagnostic_pub.publish(String(json.dumps(dict(
+            event='FRONTIER_DECISION', reason=self.continuity.reason,
+            frontiers=len(frontiers),
+            region_frontiers=0 if self.continuity.active is None else len(self.continuity.active),
+            recovery=proposed is None,
+            target=None if next_location is None else next_location.tolist(),
+            search_ms=round((time.perf_counter()-decision_started)*1000.0, 1)),
+            ensure_ascii=False)))
+        rospy.loginfo('[AR区域] %s frontiers=%d region=%d target=%s',
+                      self.continuity.reason, len(frontiers),
+                      0 if self.continuity.active is None else len(self.continuity.active),
+                      None if next_location is None else next_location.tolist())
+        return next_location
+
     def run(self, event=None):
         t1 = time.time()
+        if self.goal_feedback_enabled:
+            while self.goal_results:
+                result = self.goal_results.popleft()
+                if self.pending_goal is None or result.request_header.stamp != self.pending_goal.header.stamp:
+                    continue
+                if result.state not in (result.SUCCEEDED, result.FAILED): continue
+                self.continuity.feedback(
+                    (self.pending_goal.point.x, self.pending_goal.point.y),
+                    result.state == result.SUCCEEDED, time.monotonic())
+                if result.state == result.FAILED:
+                    p = self.pending_goal.point
+                    self.failed_until[(p.x, p.y)] = time.monotonic() + 30.0
+                self.pending_goal = None
+                self.next_waypoint_list = []
+                self.next_waypoint = None
+                self.history_waypoint_list = []
+            if not self.reset_requested and (self.pending_goal is not None or
+                    not rospy.get_param('/ariadne/execution_ready', False)):
+                # Waiting blocks decisions only. Keep frontiers and graph current,
+                # including for RViz subscribers that connect after the first goal.
+                if self.start is not None:
+                    self.update_planning_graph()
+                    if self.publish_graph:
+                        self.visualize_graph()
+                if self.pending_goal is not None and not self.paused:
+                    self.waypoint_pub.publish(self.pending_goal)  # same request ID: delivery retry, never a new decision
+                return
+            self.failed_until = {p: t for p, t in self.failed_until.items() if t > time.monotonic()}
+            self.policy_blocked_nodes = set(self.failed_until)
         if self.reset_requested:
             self.reset_for_floor()
             return
@@ -422,21 +550,7 @@ class Runner:
         self.next_waypoint_list = []
         # print("robot location at", self.robot_location)
 
-        # remove nodes on obstacles if any
-        self.robot.node_manager.check_valid_node(self.robot_location, self.map_info)
-
-        # find nearest node to the robot
-        robot_node_location = self.robot_location
-        if self.robot_location[0] != self.start[0] or self.robot_location[1] != self.start[1]:
-            if self.robot.node_manager.nodes_dict.__len__() == 0:
-                robot_node_location = self.start
-            else:
-                nearest_node = self.robot.node_manager.nodes_dict.nearest_neighbors(self.robot_location.tolist(), 1)[0]
-                node_coords = nearest_node.data.coords
-                robot_node_location = node_coords
-
-        # updating planning graph
-        self.robot.update_planning_state(self.map_info, robot_node_location)
+        robot_node_location = self.update_planning_graph()
 
         if self.escape_arrived:
             known_cells = int((self.map_info.map != parameter.UNKNOWN).sum())
@@ -482,8 +596,37 @@ class Runner:
                     "Escape recovery stopped: no farther frontier-backed node "
                     "(displacement=%.1fm, map_growth=%d)", displacement, map_growth)
 
-        # check the termination status
+        # A zero key-node utility is not proof that exploration is complete:
+        # graph rarefaction can temporarily lose utility while real frontier
+        # cells are still visible.  Reuse ARiADNE's freshly computed path to
+        # the nearest reachable frontier before considering completion.
+        global_frontiers = get_frontier_in_map(self.map_info)
+        self._global_frontier_count = len(global_frontiers)
         if sum(self.robot.key_utility) == 0:
+            frontier_count = len(global_frontiers)
+            frontier_path = self.robot.node_manager.path_to_nearest_frontier
+            if frontier_count > 0:
+                if self.goal_feedback_enabled:
+                    recovery = self.continuous_frontier_waypoint(None, global_frontiers)
+                    if recovery is not None:
+                        self.next_waypoint = recovery
+                        self.publish_waypoint(self.waypoint_wrapper(recovery))
+                        self.step += 1
+                        if self.publish_graph: self.visualize_graph()
+                        return
+                    self._log_stop('frontiers_no_reachable_approach', robot_node_location)
+                    return
+                if frontier_path:
+                    self.next_waypoint_list = list(frontier_path)
+                    self.next_waypoint = np.asarray(self.next_waypoint_list.pop(0))
+                    rospy.logwarn(
+                        "Zero policy utility with %d frontiers; use nearest-frontier path",
+                        frontier_count)
+                    self.publish_waypoint(self.waypoint_wrapper(self.next_waypoint))
+                    return
+                self._log_stop('utility_zero_with_frontiers_no_path', robot_node_location)
+                return
+
             # 停滞式完成判定（2026-08-25）：效用全零还不够，必须地图也静止满
             # STALLED_COMPLETE_SECONDS 秒才算完成。否则视为暂时停滞（门洞前沿不可见等），
             # 等地图更新后前沿自然重现。
@@ -512,7 +655,35 @@ class Runner:
 
         # network inference to get next waypoint
         next_location, next_node_index = self.robot.select_next_waypoint(
-            observation, excluded_positions=self.policy_blocked_nodes)
+            observation, excluded_positions=self.policy_blocked_nodes,
+            position_penalty=lambda p: self.continuity.penalty(p, time.monotonic()))
+        if next_location is None:
+            # All neighboring actions may be inside the 30 s failure cooldown.
+            # Release only the oldest entry so exploration can continue while
+            # retaining the remaining failure history.
+            if self.failed_until:
+                released = min(self.failed_until, key=self.failed_until.get)
+                del self.failed_until[released]
+                self.policy_blocked_nodes = set(self.failed_until)
+                rospy.logwarn(
+                    "All policy actions blocked; release oldest failed target %s",
+                    released)
+                next_location, next_node_index = self.robot.select_next_waypoint(
+                    observation, excluded_positions=self.policy_blocked_nodes,
+                    position_penalty=lambda p: self.continuity.penalty(p, time.monotonic()))
+            if next_location is None and not self.goal_feedback_enabled:
+                self._log_stop('no_valid_policy_action')
+                return
+        if self.goal_feedback_enabled:
+            next_location = self.continuous_frontier_waypoint(next_location, global_frontiers)
+            if next_location is None:
+                self._log_stop('frontiers_no_reachable_approach', robot_node_location)
+                return
+            self.next_waypoint = next_location
+            self.publish_waypoint(self.waypoint_wrapper(next_location))
+            self.step += 1
+            if self.publish_graph: self.visualize_graph()
+            return
 
         self.next_waypoint_list.append(next_location)
         if len(self.history_waypoint_list) > 0:
@@ -636,10 +807,12 @@ class Runner:
                 start = Point()
                 start.x = coords[0]
                 start.y = coords[1]
+                start.z = self.ground_z_ref
                 end_coords = (neighbor_coords - coords) / 2 + coords
                 end = Point()
                 end.x = end_coords[0]
                 end.y = end_coords[1]
+                end.z = self.ground_z_ref
                 edges.points.append(start)
                 edges.points.append(end)
 
@@ -648,7 +821,7 @@ class Runner:
         # visualize nodes
         nodes = []
         for node_coords, utility in zip(self.robot.key_node_coords, self.robot.key_utility):
-            nodes.append((node_coords[0], node_coords[1], 0.0, utility))
+            nodes.append((node_coords[0], node_coords[1], self.ground_z_ref, utility))
         header = Header()
         header.stamp = rospy.Time.now()
         header.frame_id = "map"
@@ -664,7 +837,7 @@ class Runner:
         # visualize frontiers
         frontiers = []
         for frontier in self.robot.frontier:
-            frontiers.append((frontier[0], frontier[1], 0))
+            frontiers.append((frontier[0], frontier[1], self.ground_z_ref))
         header = Header()
         header.stamp = rospy.Time.now()
         header.frame_id = "map"
