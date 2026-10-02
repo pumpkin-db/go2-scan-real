@@ -24,6 +24,15 @@ class FrontierContinuity:
         self.failures = 0
         self.history = deque(maxlen=12)
         self.cooldowns = []
+        # Session-local record of the route the robot actually traversed.
+        # It is a fallback graph only; SCAN still decides whether each leg is
+        # currently safe to execute.
+        self.trail = []
+        self.trail_breaks = set()
+        self.last_odom = None
+        self.route = []
+        self.route_uses_trail = False
+        self._trail_edges = set()
         self.reason = 'idle'
 
     def feedback(self, xy, succeeded, now):
@@ -38,6 +47,33 @@ class FrontierContinuity:
         return min(1.5, sum(0.5 * math.exp(-(now - t) / 60.0)
                    for p, t in self.history
                    if np.linalg.norm(np.asarray(xy) - p) < self.loop_radius))
+
+    def observe(self, xy, stamp):
+        """Sample the real odometry path without joining LIO jumps."""
+        point = np.asarray(xy, dtype=float)
+        if not np.isfinite(point).all():
+            return
+        if self.last_odom is not None:
+            previous, previous_stamp = self.last_odom
+            dt = stamp - previous_stamp
+            if dt <= 0:
+                if dt < -0.5:
+                    if self.trail:
+                        self.trail_breaks.add(len(self.trail))
+                    self.trail.append(point.copy())
+                    self.last_odom = (point.copy(), stamp)
+                return
+            # A timestamp gap or physically impossible displacement starts a
+            # new segment instead of creating a false edge across the map.
+            if dt > 1.0 or np.linalg.norm(point - previous) > max(0.75, 2.0 * dt):
+                if self.trail:
+                    self.trail_breaks.add(len(self.trail))
+                self.trail.append(point.copy())
+                self.last_odom = (point.copy(), stamp)
+                return
+        if not self.trail or np.linalg.norm(point - self.trail[-1]) >= 0.5:
+            self.trail.append(point.copy())
+        self.last_odom = (point.copy(), stamp)
 
     def clusters(self, frontiers):
         points = np.asarray(sorted(frontiers), dtype=float).reshape(-1, 2)
@@ -60,27 +96,65 @@ class FrontierContinuity:
             result.append(points[indices])
         return result
 
-    @staticmethod
-    def paths(nodes, start, free, clear):
-        """One heap search, independent of utility and rarefied/key nodes."""
+    def paths(self, nodes, start, free, clear):
+        """Search the current free graph plus the route actually driven."""
         start = tuple(start)
-        if start not in nodes or not free(start):
-            return {}, {}
+        adjacency = {tuple(point): set() for point in nodes if free(point)}
+        for point, node in nodes.items():
+            point = tuple(point)
+            if point not in adjacency:
+                continue
+            for neighbour in node.neighbor_set:
+                neighbour = tuple(neighbour)
+                if neighbour in adjacency and clear(point, neighbour):
+                    adjacency[point].add(neighbour)
+                    adjacency[neighbour].add(point)
+
+        self._trail_edges = set()
+        trail_keys = [tuple(np.round(point, 3)) for point in self.trail]
+        for index, point in enumerate(trail_keys):
+            adjacency.setdefault(point, set())
+            if index and index not in self.trail_breaks:
+                previous = trail_keys[index - 1]
+                adjacency[point].add(previous)
+                adjacency[previous].add(point)
+                self._trail_edges.add(frozenset((point, previous)))
+
+        # A trail may reconnect graph components only through currently clear
+        # short links. The recorded trail edges themselves remain available
+        # despite stale accumulated-map obstacles.
+        ordinary = list(nodes)
+        if ordinary and trail_keys:
+            tree = cKDTree(np.asarray(ordinary))
+            for point in trail_keys:
+                for index in tree.query_ball_point(point, 1.5):
+                    neighbour = tuple(ordinary[index])
+                    if neighbour in adjacency and clear(point, neighbour):
+                        adjacency[point].add(neighbour)
+                        adjacency[neighbour].add(point)
+
+        adjacency.setdefault(start, set())
+        if trail_keys:
+            nearest = min(trail_keys, key=lambda point: math.hypot(
+                point[0] - start[0], point[1] - start[1]))
+            if math.hypot(nearest[0] - start[0], nearest[1] - start[1]) <= 0.8:
+                adjacency[start].add(nearest)
+                adjacency[nearest].add(start)
+                self._trail_edges.add(frozenset((start, nearest)))
+        for point in ordinary:
+            point = tuple(point)
+            if point in adjacency and math.hypot(
+                    point[0] - start[0], point[1] - start[1]) <= 2.0 \
+                    and clear(start, point):
+                adjacency[start].add(point)
+                adjacency[point].add(start)
+
         distances, parents, queue = {start: 0.0}, {start: None}, [(0.0, start)]
-        checked = {}
         while queue:
             distance, u = heapq.heappop(queue)
             if distance != distances[u]:
                 continue
-            for v in sorted(nodes[u].neighbor_set):
-                v = tuple(v)
-                if v == u or v not in nodes:
-                    continue
-                edge = tuple(sorted((u, v)))
-                if edge not in checked:
-                    checked[edge] = free(v) and free(u) and clear(u, v)
-                if not checked[edge]:
-                    continue
+            for v in sorted(adjacency[u]):
                 candidate = distance + math.hypot(v[0] - u[0], v[1] - u[1])
                 if candidate < distances.get(v, float('inf')):
                     distances[v], parents[v] = candidate, u
@@ -96,6 +170,8 @@ class FrontierContinuity:
         releases on disappearance/failure/no progress, and retries all components
         if soft cooldown would otherwise suppress every choice.
         """
+        self.route = []
+        self.route_uses_trail = False
         regions = self.clusters(frontiers)
         if not regions:
             self.active = None
@@ -111,6 +187,8 @@ class FrontierContinuity:
             for p, distance in distances.items():
                 if p in excluded or np.linalg.norm(np.asarray(p) - robot) <= min_distance:
                     continue
+                if not free(p):
+                    continue
                 near = tree.query_ball_point(p, observation_range)
                 near.sort(key=lambda j: np.linalg.norm(np.asarray(p) - regions[index][j]))
                 visible = next((j for j in near if clear(p, regions[index][j])), None)
@@ -120,6 +198,25 @@ class FrontierContinuity:
                 choices.append((distance + offset + self.penalty(p, now), p))
             if choices:
                 routes[index] = min(choices)[1]
+        history_approach = not routes and proposed is None
+        if history_approach:
+            # A return leg need not already observe the frontier. Reposition
+            # along recorded, reachable history first; SCAN checks each leg.
+            # Require progress toward the frontier so reaching the closest
+            # historical point cannot create an endless back-and-forth loop.
+            trail_points = {tuple(np.round(p, 3)) for p in self.trail}
+            for index, tree in enumerate(trees):
+                current_distance = float(tree.query(robot)[0])
+                choices = []
+                for p in trail_points.intersection(distances):
+                    if p in excluded or not free(p) or np.linalg.norm(
+                            np.asarray(p) - robot) <= min_distance:
+                        continue
+                    offset = float(tree.query(p)[0])
+                    if offset + min_distance < current_distance:
+                        choices.append((offset, distances[p], p))
+                if choices:
+                    routes[index] = min(choices)[2]
         if not routes:
             self.active = None
             self.reason = 'frontiers_no_reachable_approach'
@@ -170,6 +267,8 @@ class FrontierContinuity:
         else:
             self.reason = 'hold_region'
         self.active = regions[active_index].copy()
+        if history_approach:
+            self.reason += ':history_approach'
 
         # Keep the policy choice if it observes this region and is reachable.
         if proposed is not None:
@@ -187,6 +286,39 @@ class FrontierContinuity:
             path.append(p)
             p = parents[p]
         path.reverse()
+        edges = [frozenset((a, b)) for a, b in zip([tuple(start)] + path, path)]
+        self.route_uses_trail = any(edge in self._trail_edges for edge in edges)
+        self.route = [tuple(start)] + path
+
+        if self.route_uses_trail:
+            # Follow the recorded polyline in short legs. Stop at meaningful
+            # corners instead of asking SCAN to cut straight through a wall.
+            leg = []
+            travelled = 0.0
+            previous = tuple(robot)
+            for index, point in enumerate(path):
+                travelled += np.linalg.norm(np.asarray(point) - np.asarray(previous))
+                if travelled > waypoint_range:
+                    break
+                leg.append(point)
+                previous = point
+                if index + 1 < len(path) and np.linalg.norm(
+                        np.asarray(point) - robot) > min_distance:
+                    incoming = robot if index == 0 else np.asarray(path[index - 1])
+                    first = np.asarray(point) - incoming
+                    second = np.asarray(path[index + 1]) - np.asarray(point)
+                    if np.dot(first, second) < math.cos(math.radians(30)) \
+                            * np.linalg.norm(first) * np.linalg.norm(second):
+                        break
+            candidates = [point for point in leg if point not in excluded and
+                          np.linalg.norm(np.asarray(point) - robot) > min_distance and
+                          free(point)]
+            if not candidates:
+                self.reason += ':return_route_no_waypoint'
+                return proposed
+            self.reason += ':return_route'
+            return np.asarray(candidates[-1])
+
         # Farthest visible path point within normal waypoint range. The bridge
         # still owns clearance relocation and SCAN still owns all arrival tests.
         candidates = [p for p in path if p not in excluded and

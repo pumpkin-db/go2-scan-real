@@ -110,8 +110,9 @@ class NodeManager:
         t3 = time.time()
         # print("update edges", t3 - t2)
 
-        # remove nodes unconnected to the origin
-        self.remove_unconnected_nodes(self.start)
+        # Keep temporarily disconnected components. Historical odometry can
+        # reconnect a route already driven even when accumulated-map residue
+        # splits the ordinary graph.
         t4 = time.time()
 
         redundant_nodes = self.new_nodes & self.removed_nodes
@@ -124,6 +125,8 @@ class NodeManager:
             return robot_location
         else:
             rospy.loginfo("The current node should be removed.")
+            if len(self.nodes_dict) == 0:
+                self.add_node_to_dict(robot_location, set(), map_info)
             nearest_node = self.nodes_dict.nearest_neighbors(robot_location.tolist(), 1)[0].data
             self.last = nearest_node.coords
             return nearest_node.coords

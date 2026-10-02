@@ -65,8 +65,13 @@ def get_free_and_connected_map(location, map_info):
     # a binary map for free and connected areas
     free = (map_info.map == parameter.FREE).astype(float)
     labeled_free = label(free, connectivity=2)
-    cell = get_cell_position_from_coords(location, map_info)
+    cell = get_cell_position_from_coords(location, map_info, check_negative=False)
+    if not (0 <= cell[0] < free.shape[1] and 0 <= cell[1] < free.shape[0]):
+        return np.zeros_like(free, dtype=bool)
     label_number = labeled_free[cell[1], cell[0]]
+    if label_number == 0:
+        # Label zero is occupied/unknown background, never a free component.
+        return np.zeros_like(free, dtype=bool)
     connected_free_map = (labeled_free == label_number)
     return connected_free_map
 
@@ -102,7 +107,7 @@ def get_updating_node_coords(location, updating_map_info, check_connectivity=Tru
             assert 0 <= cell[1] < updating_map_info.map.shape[0] and 0 <= cell[0] < updating_map_info.map.shape[1]
             if updating_map_info.map[cell[1], cell[0]] == parameter.FREE:
                 indices.append(i)
-        indices = np.array(indices)
+        indices = np.array(indices, dtype=int)
         nodes = nodes[indices].reshape(-1, 2)
 
     else:
@@ -115,7 +120,7 @@ def get_updating_node_coords(location, updating_map_info, check_connectivity=Tru
             assert 0 <= cell[1] < free_connected_map.shape[0] and 0 <= cell[0] < free_connected_map.shape[1]
             if free_connected_map[cell[1], cell[0]] == 1:
                 indices.append(i)
-        indices = np.array(indices)
+        indices = np.array(indices, dtype=int)
         nodes = nodes[indices].reshape(-1, 2)
 
     return nodes, free_connected_map
@@ -172,7 +177,10 @@ def frontier_down_sample(data, voxel_size):
 
 
 def is_free(location, map_info):
-    cell = get_cell_position_from_coords(location, map_info)
+    cell = get_cell_position_from_coords(location, map_info, check_negative=False)
+    if not (0 <= cell[0] < map_info.map.shape[1] and
+            0 <= cell[1] < map_info.map.shape[0]):
+        return False
     if map_info.map[cell[1], cell[0]] != parameter.FREE:
         return False
     else:

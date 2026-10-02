@@ -37,7 +37,8 @@ class ScanAccumulator:
         self.sub_cloud = rospy.Subscriber('/mid360_points', PointCloud2, self.cloud_cb, queue_size=1)
         self.sub_pose = rospy.Subscriber('/quad_0/lidar_pose', Odometry, self.pose_cb, queue_size=1)
         rospy.Timer(rospy.Duration(1.0), self.publish_cb)
-        self.reset_timer = rospy.Timer(rospy.Duration(self.reset_interval), self.reset_cb)
+        self.reset_timer = (rospy.Timer(rospy.Duration(self.reset_interval), self.reset_cb)
+                            if self.reset_interval > 0 else None)
         rospy.Service('/scan_map/save', Trigger, self.save_cb)
         rospy.Service('/scan_map/clear', Empty, self.clear_cb)
         rospy.loginfo('[scan_cloud_accumulator] ready: world-frame segmented map, voxel=%.2fm, reset=%.1fs',

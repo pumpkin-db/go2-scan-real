@@ -16,6 +16,9 @@ fail() { echo "[FAIL] $*" >&2; exit 42; }
 [ -x "$ROOT/2D/SENSOR-SCAN/devel/lib/sensor_scan_generation/sensorScanGeneration" ] || fail 'sensor scan package is not built'
 [ -x "$ROOT/2D/ELEVATION-MAPPING/devel/lib/elevation_mapping/elevation_mapping" ] || fail 'optional elevation mapping workspace is not built'
 [ -x "$ROOT/2D/go2-scan/algorithms/local_planning/scan_planner/devel/lib/scan_planner/scan_planner_node" ] || fail 'SCAN is not built'
+for executable in tare_planner/tare_planner_node terrain_analysis/terrainAnalysis terrain_analysis_ext/terrainAnalysisExt; do
+  [ -x "$ROOT/2D/go2-scan/algorithms/global_planning/tare_planner/devel/lib/$executable" ] || fail "TARE executable is missing: $executable"
+done
 [ -x "$ROOT/2D/go2-scan/integration/go2_motion/build/cmd_vel_bridge" ] || fail 'motion bridge is not built'
 
 mkdir -p "$ROOT/.cache/matplotlib"
@@ -26,11 +29,24 @@ bash -n "$ROOT/setup_nx.sh" "$ROOT/build_all.sh" \
   "$ROOT/2D/go2-scan/real/launch_fastlio_for_scan-planner_NX.sh"
 python3 -m py_compile \
   "$ROOT/tools/configure_board.py" \
+  "$ROOT/2D/go2-scan/integration/go2_tare/scripts/tare_input_bridge.py" \
+  "$ROOT/2D/go2-scan/integration/go2_tare/scripts/tare_scan_bridge.py" \
+  "$ROOT/2D/go2-scan/integration/go2_tare/scripts/tare_observer.py" \
   "$ROOT/2D/go2-scan/real/sync_mid360_clock.py" \
   "$ROOT/2D/go2-scan/real/navigation_status_monitor.py" \
   "$ROOT/2D/go2-scan/integration/go2_bridge/scripts/ariadne_goal_bridge.py" \
   "$ROOT/2D/go2-scan/algorithms/global_planning/ariadne/src/rl_planner/scripts/exploration_continuity.py"
 
+# Resolve every workspace from this release, even when another ~/Go2 tree exists.
+export FASTLIO_WS="$ROOT/2D/FAST-LIO"
+export SENSOR_SCAN_WS="$ROOT/2D/SENSOR-SCAN"
+export SCAN="$ROOT/2D/go2-scan/algorithms/local_planning/scan_planner"
+export TARE_WS="$ROOT/2D/go2-scan/algorithms/global_planning/tare_planner"
+export ELEVATION_WS="$ROOT/2D/ELEVATION-MAPPING"
 ROS_IP=127.0.0.1 "$ROOT/2D/go2-scan/real/launch_fastlio_NX.sh" motion:=false --check >/dev/null
+ROS_IP=127.0.0.1 "$ROOT/2D/go2-scan/real/launch_fastlio_NX.sh" motion:=true --check >/dev/null
+ROS_IP=127.0.0.1 "$ROOT/2D/go2-scan/real/launch_fastlio_NX.sh" motion:=false path:=false --check >/dev/null
+ROS_IP=127.0.0.1 "$ROOT/2D/go2-scan/real/launch_fastlio_NX.sh" motion:=false exploration:=ariadne --check >/dev/null
+ROS_IP=127.0.0.1 "$ROOT/2D/go2-scan/real/launch_fastlio_for_scan-planner_NX.sh" motion:=false --check >/dev/null
 ROS_IP=127.0.0.1 "$ROOT/2D/go2-scan/real/launch_fastlio_NX.sh" motion:=false elevation:=true --check >/dev/null
 echo '[PASS] self-contained real stack preflight passed; no hardware was started'

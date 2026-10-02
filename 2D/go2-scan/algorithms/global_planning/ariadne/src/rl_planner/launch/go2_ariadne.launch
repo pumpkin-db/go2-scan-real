@@ -51,6 +51,7 @@
   <!-- use_planner=false 时只跑地图链(sensor_scan_generation+octomap+map_world_bridge)，不跑 rl_planner：
        供 SCAN 手动模式查看 /projected_map 但禁用 ARiADNE 决策。默认 true=原版。 -->
   <arg name="use_planner" default="true"/>
+  <arg name="continuous_exploration" default="false"/>
   <!-- Alternate map providers (for example elevation traversability) can
        keep the official AR planner while disabling only this OctoMap builder. -->
   <arg name="use_map_builder" default="true"/>
@@ -129,6 +130,7 @@
        数值一致性由本链路构造保证（里程计≡世界坐标，见 third_party.md）。 -->
   <group if="$(arg use_planner)">
   <node pkg="rl_planner" type="run_planner.sh" name="rl_planner" output="screen" cwd="node">
+    <param name="continuous_exploration" value="$(arg continuous_exploration)" type="bool"/>
     <!-- 决策层要的是机器人所在位置（机体中心即可，x/y 差 <1 格）；
          与上面建图用的 lidar_pose 分开接，各取所需。 -->
     <remap from="/state_estimation" to="/quad_0/body_pose"/>

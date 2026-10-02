@@ -18,8 +18,6 @@ namespace
 {
 using scan_planner::UniformBspline;
 
-constexpr double kMaxVYawLimit = 1.0;
-
 ros::Publisher cmd_vel_pub;
 ros::Publisher execution_frozen_pub;
 ros::Subscriber bspline_sub;
@@ -43,7 +41,6 @@ ros::Time last_update_time;
 
 double time_forward;
 double heading_error_threshold;
-double heading_slowdown_start;
 double kp_pos;
 double kp_yaw;
 double max_vx;
@@ -67,23 +64,12 @@ bool loadParams(const ros::NodeHandle &nh)
   ros::param::param<std::string>("/body_pose_topic", body_pose_topic, std::string("/quad_0/body_pose"));
   ok &= loadRequiredParam(nh, "time_forward", time_forward);
   ok &= loadRequiredParam(nh, "heading_error_threshold", heading_error_threshold);
-  ok &= loadRequiredParam(nh, "heading_slowdown_start", heading_slowdown_start);
   ok &= loadRequiredParam(nh, "kp_pos", kp_pos);
   ok &= loadRequiredParam(nh, "kp_yaw", kp_yaw);
   ok &= loadRequiredParam(nh, "max_vx", max_vx);
   ok &= loadRequiredParam(nh, "max_vy", max_vy);
   ok &= loadRequiredParam(nh, "max_vyaw", max_vyaw);
   ok &= loadRequiredParam(nh, "finish_dist", finish_dist);
-  if (ok && (heading_slowdown_start < 0.0 || heading_slowdown_start >= heading_error_threshold))
-  {
-    ROS_ERROR("[closed_loop_controller] require 0 <= heading_slowdown_start < heading_error_threshold.");
-    ok = false;
-  }
-  if (ok && max_vyaw > kMaxVYawLimit)
-  {
-    ROS_WARN("[closed_loop_controller] cap max_vyaw %.3f to %.3f rad/s.", max_vyaw, kMaxVYawLimit);
-    max_vyaw = kMaxVYawLimit;
-  }
   return ok;
 }
 
@@ -109,10 +95,13 @@ Eigen::Vector2d clampNorm(const Eigen::Vector2d &value, double max_norm)
   return value / norm * max_norm;
 }
 
-double estimateDesiredYaw(double t_cur, const Eigen::Vector3d &pos_des)
+double estimateDesiredYaw(double t_cur)
 {
   const double t_look = std::min(traj_duration, t_cur + time_forward);
-  Eigen::Vector3d dir = traj[0].evaluateDeBoorT(t_look) - pos_des;
+  // Point the body from its measured position toward a point ahead on the
+  // trajectory.  Using two spline samples here made replanning tangents flip
+  // by pi even while the goal was visually in front of the robot.
+  Eigen::Vector3d dir = traj[0].evaluateDeBoorT(t_look) - odom_pos;
 
   if (dir.head<2>().squaredNorm() < 1e-4)
   {
@@ -200,11 +189,11 @@ void cmdCallback(const ros::TimerEvent &)
   Eigen::Vector3d pos_des = traj[0].evaluateDeBoorT(t_eval);
   Eigen::Vector3d vel_des = traj[1].evaluateDeBoorT(t_eval);
 
-  const double yaw_des = estimateDesiredYaw(t_eval, pos_des);
+  const double yaw_des = estimateDesiredYaw(t_eval);
   const double yaw_err = normalizeAngle(yaw_des - odom_yaw);
   const double vyaw_cmd = clamp(kp_yaw * yaw_err, -max_vyaw, max_vyaw);
 
-  if (std::abs(yaw_err) >= heading_error_threshold)
+  if (std::abs(yaw_err) > heading_error_threshold)
   {
     publishExecutionFrozen(true);
     publishStop(vyaw_cmd);
@@ -222,16 +211,6 @@ void cmdCallback(const ros::TimerEvent &)
   Eigen::Vector2d pos_err(pos_des(0) - odom_pos(0), pos_des(1) - odom_pos(1));
   Eigen::Vector2d vel_ff(vel_des(0), vel_des(1));
   Eigen::Vector2d vel_world = clampNorm(vel_ff + kp_pos * pos_err, std::max(max_vx, max_vy));
-
-  const double abs_yaw_err = std::abs(yaw_err);
-  if (abs_yaw_err > heading_slowdown_start)
-  {
-    const double heading_speed_scale = clamp(
-        (heading_error_threshold - abs_yaw_err) /
-            (heading_error_threshold - heading_slowdown_start),
-        0.0, 1.0);
-    vel_world *= heading_speed_scale;
-  }
 
   const double c = std::cos(odom_yaw);
   const double s = std::sin(odom_yaw);

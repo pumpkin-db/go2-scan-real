@@ -3,12 +3,23 @@
   <arg name="fastlio_config" default="$(env HOME)/Go2/2D/FAST-LIO/src/FAST_LIO/config/mid360.yaml"/>
   <arg name="driver_config" default="$(env HOME)/Go2/2D/FAST-LIO/src/livox_ros_driver2/config/MID360_config.json"/>
   <arg name="navigation_mode" default="auto"/>
+  <arg name="exploration" default="tare"/>
   <arg name="mode" default="prone"/>
   <arg name="rviz" default="false"/>
   <arg name="elevation" default="false"/>
+  <arg name="continuous" default="false"/>
+  <arg name="vp" default="0.5"/>
+  <arg name="extend" default="false"/>
+  <arg name="path" default="$(eval navigation_mode == 'auto' and exploration == 'tare')"/>
+  <arg name="target_min_clearance" default="0.40"/>
+  <arg name="target_min_robot_distance" default="0.80"/>
+  <arg name="target_search_radius" default="5.0"/>
 
-  <arg name="navi_mode" value="$(eval 3 if navigation_mode == 'auto' else 1)"/>
-  <arg name="ar_planner" value="$(eval navigation_mode == 'auto')"/>
+  <!-- TARE uses the simulation's single-goal SCAN interface; AR retains its
+       reference-path interface. Manual/RViz goals remain mode 1. -->
+  <arg name="navi_mode" value="$(eval 1 if navigation_mode == 'manual' or (navigation_mode == 'auto' and exploration == 'tare' and not arg('path')) else 3)"/>
+  <arg name="ar_planner" value="$(eval navigation_mode == 'auto' and exploration == 'ariadne')"/>
+  <arg name="tare_planner" value="$(eval navigation_mode == 'auto' and exploration == 'tare')"/>
   <arg name="ground_z" value="$(eval -0.310 if mode == 'prone' else -0.565)"/>
   <arg name="ar_min_z" value="$(eval -0.110 if mode == 'prone' else -0.365)"/>
   <arg name="ar_max_z" value="$(eval 0.490 if mode == 'prone' else 0.235)"/>
@@ -16,10 +27,14 @@
        below it, so its height above ground follows directly from mode. -->
   <arg name="body_ground_clearance" value="$(eval 0.09303 if mode == 'prone' else 0.34803)"/>
 
+  <param name="/exploration/algorithm" value="$(eval exploration if navigation_mode == 'auto' else 'manual')"/>
   <param name="use_sim_time" value="false"/>
   <param name="/ariadne/execution_ready" value="false"/>
+  <param name="/exploration/execution_ready" value="false"/>
   <param name="/rl_planner/goal_feedback" value="$(arg ar_planner)"/>
-  <param name="/scan_planner_node/fsm/goal_feedback" value="$(arg ar_planner)"/>
+  <param name="/scan_planner_node/fsm/goal_feedback" value="$(eval navigation_mode == 'auto')"/>
+  <!-- TARE uses the same occupied-endpoint shortening as the GUI simulation. -->
+  <param name="/scan_planner_node/fsm/adjust_occupied_target" value="$(arg tare_planner)"/>
 
   <!-- NX owns this driver.  Board-side resident drivers are outside this graph. -->
   <param name="xfer_format" value="1"/>
@@ -63,7 +78,7 @@
   <include if="$(arg elevation)" file="$(find go2_elevation)/launch/go2_elevation.launch"/>
 
   <!-- AR-only input cleanup.  Height slicing happens in projected_map, not here. -->
-  <node pkg="go2_bridge" type="cloud_range_filter.py" name="cloud_range_filter" required="true" output="screen">
+  <node unless="$(arg tare_planner)" pkg="go2_bridge" type="cloud_range_filter.py" name="cloud_range_filter" required="true" output="screen">
     <param name="min_range" value="0.7"/>
     <param name="max_range" value="5.0"/>
     <param name="confirmation_frames" value="2"/>
@@ -87,7 +102,10 @@
     <arg name="sensor_pose_topic" value="/LIO/odom_imu"/>
     <arg name="cloud_topic" value="/LIO/clouds_lidar_scan"/>
     <arg name="cloud_is_world" value="false"/>
-    <arg name="use_path_height" value="$(arg elevation)"/>
+    <!-- NX velocity limits; downstream bridges do not clamp again. -->
+    <arg name="max_vel" value="0.55"/>
+    <arg name="max_vyaw" value="0.80"/>
+    <arg name="use_path_height" value="$(eval elevation and not tare_planner)"/>
     <arg name="body_height" value="$(arg body_ground_clearance)"/>
     <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw"/>
     <arg name="cx" value="317.19183349609375"/>
@@ -95,14 +113,9 @@
     <arg name="fx" value="609.5884399414062"/>
     <arg name="fy" value="609.22021484375"/>
   </include>
-  <node pkg="scan_planner" name="closed_loop_controller" type="closed_loop_controller" required="true" output="screen">
-    <remap from="cmd_vel" to="/scan_planner/cmd_vel"/>
-  </node>
-  <node pkg="go2_mid360_raw" name="cmd_vel_safety_gate" type="cmd_vel_safety_gate.py"
-        required="true" output="screen">
-    <param name="odom_timeout" value="0.5"/>
-    <param name="command_timeout" value="0.25"/>
-  </node>
+  <!-- One control path only: B-spline tracker -> /cmd_vel -> Unitree SDK bridge. -->
+  <node pkg="scan_planner" name="closed_loop_controller" type="closed_loop_controller"
+        required="true" output="screen"/>
   <param name="robot_description" textfile="$(find go2_description)/urdf/go2_description.urdf"/>
   <node pkg="robot_state_publisher" type="robot_state_publisher" name="go2_robot_state_publisher" output="screen"/>
   <node pkg="scan_planner" name="go2_gait_publisher" type="go2_gait_publisher" output="screen"/>
@@ -120,8 +133,10 @@
     <param name="save_dir" value="$(env HOME)/Go2/2D/go2-scan/real"/>
   </node>
 
-  <!-- AR map is always present.  Only the automatic entry enables its planner. -->
-  <include file="$(find rl_planner)/launch/go2_ariadne.launch">
+  <!-- AR map is used in AR/manual modes only. TARE owns its terrain maps. -->
+  <node if="$(arg tare_planner)" pkg="tf2_ros" type="static_transform_publisher" name="map_world_bridge" args="0 0 0 0 0 0 1 map world"/>
+  <include unless="$(arg tare_planner)" file="$(find rl_planner)/launch/go2_ariadne.launch">
+    <arg name="continuous_exploration" value="$(arg continuous)"/>
     <arg name="map_topic" value="/projected_map"/>
     <arg name="ground_z_ref" value="$(arg ground_z)"/>
     <arg name="map_resolution" value="0.1"/>
@@ -143,7 +158,7 @@
 
   <!-- The default 2-D map stays at its configured ground height.  Z drift is
        removed at the AR-only sensor scan boundary above. -->
-  <node unless="$(arg elevation)" pkg="go2_bridge" name="projected_map_ground" type="projected_map_ground.py" output="screen">
+  <node if="$(eval not elevation and not tare_planner)" pkg="go2_bridge" name="projected_map_ground" type="projected_map_ground.py" output="screen">
     <param name="ground_z" value="$(arg ground_z)" type="double"/>
     <param name="in_topic" value="/projected_map_occ"/>
     <param name="out_topic" value="/projected_map"/>
@@ -152,9 +167,17 @@
   <group if="$(arg ar_planner)">
     <node pkg="go2_bridge" name="ariadne_goal_bridge" type="ariadne_goal_bridge.py" required="true" output="screen">
       <param name="repub_dist" value="0.5"/>
-      <param name="target_min_clearance" value="0.40"/>
-      <param name="target_min_robot_distance" value="0.80"/>
-      <param name="target_search_radius" value="5.0"/>
+      <param name="target_min_clearance" value="$(arg target_min_clearance)"/>
+      <param name="target_min_robot_distance" value="$(arg target_min_robot_distance)"/>
+      <param name="target_search_radius" value="$(arg target_search_radius)"/>
+      <!-- Keep projected_map as exploration memory, but take endpoint
+           clearance from SCAN's fresh rolling occupancy whenever available. -->
+      <param name="local_clearance_topic" value="/grid_map/occupancy"/>
+      <param name="local_clearance_max_age" value="1.0"/>
+      <param name="local_clearance_max_robot_distance" value="4.5"/>
+      <param name="local_clearance_voxel_size" value="0.05"/>
+      <param name="local_obstacle_min_height" value="0.20"/>
+      <param name="local_obstacle_max_height" value="0.80"/>
       <param name="use_elevation" value="$(arg elevation)"/>
       <param name="elevation_cloud_topic" value="/local_elevation_cloud"/>
       <param name="elevation_max_distance" value="0.20"/>
@@ -166,7 +189,14 @@
     </node>
   </group>
 
+  <include if="$(arg tare_planner)" file="$(find go2_tare)/launch/tare_fastlio.launch">
+    <arg name="vehicle_height" value="$(eval 0.310 if mode == 'prone' else 0.565)"/>
+    <arg name="vp" value="$(arg vp)"/>
+    <arg name="extend" value="$(arg extend)"/>
+    <arg name="path" value="$(arg path)"/>
+  </include>
+
   <group if="$(arg rviz)">
-    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find scan_planner)/launch/default.rviz"/>
+    <node pkg="rviz" type="rviz" name="rviz" args="-d $(eval find('go2_tare') + '/rviz/tare.rviz' if tare_planner else find('scan_planner') + '/launch/default.rviz')"/>
   </group>
 </launch>

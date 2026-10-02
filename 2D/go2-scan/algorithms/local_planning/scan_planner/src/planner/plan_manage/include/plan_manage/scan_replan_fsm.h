@@ -72,8 +72,9 @@ namespace scan_planner
     /* planning data */
     bool trigger_, have_target_, have_odom_, have_new_target_;
     bool rviz_height_ready_;
-    bool use_path_height_;
     bool go2_execution_frozen_;
+    bool use_path_height_;
+    bool adjust_occupied_target_{false};
     bool enable_fail_safe_, need_hover_stop_;
     FSM_EXEC_STATE exec_state_;
     int continuously_called_times_{0};
@@ -128,9 +129,9 @@ namespace scan_planner
     void getLocalTarget();
     void finishProcess();
     void publishSelfInflationMarker();
+    void updateLocalTrajTimeFreeze();
     double getOdomYaw() const;
     double estimateYawFromSegment(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;
-    void updateLocalTrajTimeFreeze();
 
     /* ROS functions */
     void execFSMCallback(const ros::TimerEvent &e);

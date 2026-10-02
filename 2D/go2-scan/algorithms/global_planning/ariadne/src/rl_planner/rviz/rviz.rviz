@@ -104,7 +104,7 @@ Visualization Manager:
       History Length: 1
       Name: Waypoint
       Queue Size: 10
-      Radius: 0.5
+      Radius: 0.4
       Topic: /way_point
       Unreliable: false
       Value: true

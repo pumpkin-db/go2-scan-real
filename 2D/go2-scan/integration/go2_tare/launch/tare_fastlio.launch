@@ -1,0 +1,68 @@
+<launch>
+  <arg name="vehicle_height" default="0.565"/>
+  <arg name="vp" default="0.5"/>
+  <arg name="extend" default="false"/>
+  <arg name="path" default="true"/>
+  <node pkg="go2_tare" type="tare_input_bridge.py" name="tare_input_bridge" required="true" output="screen"/>
+  <group>
+    <remap from="/state_estimation" to="/tare/state_estimation"/>
+    <remap from="/registered_scan" to="/tare/registered_scan"/>
+    <remap from="/terrain_map" to="/tare/terrain_map"/>
+    <remap from="/terrain_map_ext" to="/tare/terrain_map_ext"/>
+    <include file="$(find terrain_analysis)/launch/terrain_analysis.launch"/>
+    <include file="$(find terrain_analysis_ext)/launch/terrain_analysis_ext.launch"/>
+  </group>
+  <param name="/terrainAnalysis/vehicleHeight" value="$(arg vehicle_height)"/>
+  <param name="/terrainAnalysisExt/vehicleHeight" value="$(arg vehicle_height)"/>
+  <!-- The official 1Hz planning loop and indoor profile are retained. -->
+  <node pkg="tare_planner" type="tare_planner_node" name="tare_planner_node" ns="sensor_coverage_planner" required="true" output="screen">
+    <rosparam command="load" file="$(find tare_planner)/config/indoor.yaml"/>
+    <param name="viewpoint_manager/resolution_x" value="$(arg vp)" type="double"/>
+    <param name="viewpoint_manager/resolution_y" value="$(arg vp)" type="double"/>
+    <param name="kAutoStart" value="false"/>
+    <!-- The planner keeps refreshing its current exploration intent like the
+         simulation; tare_scan_bridge serializes delivery to SCAN. -->
+    <param name="kWaitForScanGoalResult" value="false"/>
+    <param name="kContinuousExploration" value="true"/>
+    <!-- Keep the 4m lookahead; endpoint extension is opt-in for single-goal SCAN. -->
+    <param name="kCheckTerrainCollision" value="false"/>
+    <!-- Release stale viewpoint collisions after clear visibility is restored. -->
+    <param name="kCheckDynamicObstacleCollision" value="true"/>
+    <param name="kCollisionFrameCountMax" value="1"/>
+    <param name="kViewPointCollisionMargin" value="0.35"/>
+    <param name="kViewPointCollisionMarginZPlus" value="0.35"/>
+    <param name="kViewPointCollisionMarginZMinus" value="0.35"/>
+    <param name="kExtendWayPoint" value="$(eval arg('extend') and not arg('path'))" type="bool"/>
+    <param name="kPublishExecutionPath" value="$(arg path)" type="bool"/>
+    <param name="kExtendWayPointDistanceBig" value="4.0"/>
+    <param name="kExtendWayPointDistanceSmall" value="3.5"/>
+    <param name="kLookAheadDistance" value="4.0"/>
+    <!-- SCAN reaches at .6m (body frame); allow the LiDAR/body offset at home. -->
+    <param name="kAtHomeDistThreshold" value="1.0"/>
+    <param name="kRushHomeDist" value="3.0"/>
+    <param name="sub_start_exploration_topic_" value="/tare/start_exploration"/>
+    <param name="sub_state_estimation_topic_" value="/tare/state_estimation_at_scan"/>
+    <param name="sub_registered_scan_topic_" value="/tare/registered_scan"/>
+    <param name="sub_terrain_map_topic_" value="/tare/terrain_map"/>
+    <param name="sub_terrain_map_ext_topic_" value="/tare/terrain_map_ext"/>
+    <param name="pub_waypoint_topic_" value="/tare/way_point"/>
+  </node>
+  <node pkg="go2_tare" type="tare_scan_bridge.py" name="tare_scan_bridge" required="true" output="screen">
+    <param name="use_path" value="$(arg path)" type="bool"/>
+  </node>
+  <!-- Display branch only; no planner consumes this accumulated map. -->
+  <node pkg="topic_tools" type="throttle" name="tare_history_throttle"
+        args="messages /tare/registered_scan 1.0 /tare/history_input"/>
+  <node pkg="go2_bridge" type="scan_cloud_accumulator.py" name="tare_observed_map" output="screen">
+    <remap from="/mid360_points" to="/tare/history_input"/>
+    <remap from="/scan_map" to="/tare/observed_map"/>
+    <remap from="/scan_map/save" to="/tare/observed_map/save"/>
+    <remap from="/scan_map/clear" to="/tare/observed_map/clear"/>
+    <param name="voxel_size" value="0.3"/>
+    <param name="reset_interval" value="0.0"/>
+    <param name="max_range" value="7.5"/>
+    <param name="publish_max_points" value="300000"/>
+    <param name="save_dir" value="$(env HOME)/Go2/2D/go2-scan/real/tare_maps"/>
+  </node>
+  <node pkg="go2_tare" type="tare_observer.py" name="tare_observer" output="screen"/>
+</launch>

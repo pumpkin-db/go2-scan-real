@@ -1,6 +1,10 @@
 #!/bin/bash
-# NX MID360 -> FAST-LIO -> official SCAN parameters -> AR map/automatic exploration.
-# motion:=false is the default.  Real runs always synchronize clocks before acquisition.
+# NX MID360 -> FAST-LIO -> SCAN; select ARiADNE or TARE for exploration.
+# motion:=false is the default. Data comes directly from MID360;
+# pre-start clock synchronization uses the board's existing PTP master.
+# Optional vp:=0.2 sets TARE's XY viewpoint spacing in metres (default 0.5).
+# Optional extend:=true enables TARE's straight-line waypoint extension (default false).
+# TARE defaults to path:=true (forces extend=false); path:=false selects single-goal mode.
 set -eo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,19 +16,29 @@ scan_ws="${SCAN:-$go2_root/algorithms/local_planning/scan_planner}"
 sensor_scan_ws="${SENSOR_SCAN_WS:-$HOME/Go2/2D/SENSOR-SCAN}"
 elevation_ws="${ELEVATION_WS:-$HOME/Go2/2D/ELEVATION-MAPPING}"
 ariadne="${ARIADNE:-$go2_root/algorithms/global_planning/ariadne}"
+tare_ws="${TARE_WS:-$go2_root/algorithms/global_planning/tare_planner}"
 motion_ws="$go2_root/integration/go2_motion"
 log_dir="$script_dir/logs/fastlio_navigation"
 
 navigation=auto
+exploration=tare
 motion=false
 record_bag=false
 rviz=false
 check=false
 elevation=false
+continuous=false
+vp=0.5
+extend=false
+path=true
+path_explicit=false
 for argument in "$@"; do
   case "$argument" in
     navigation:=auto) navigation=auto;;
     navigation:=manual) navigation=manual;;
+    exploration:=ariadne) exploration=ariadne;;
+    exploration:=tare) exploration=tare;;
+    exploration:=*) echo "[FATAL] exploration must be ariadne or tare: $argument" >&2; exit 2;;
     motion:=true) motion=true;;
     motion:=false) motion=false;;
     motion:=*) echo "[FATAL] invalid motion argument: $argument" >&2; exit 2;;
@@ -36,6 +50,16 @@ for argument in "$@"; do
     elevation:=true) elevation=true;;
     elevation:=false) elevation=false;;
     elevation:=*) echo "[FATAL] invalid elevation argument: $argument" >&2; exit 2;;
+    continuous:=true) continuous=true;;
+    continuous:=false) continuous=false;;
+    continuous:=*) echo "[FATAL] invalid continuous argument: $argument" >&2; exit 2;;
+    vp:=*) vp="${argument#vp:=}";;
+    extend:=true) extend=true;;
+    extend:=false) extend=false;;
+    extend:=*) echo "[FATAL] extend must be true or false: $argument" >&2; exit 2;;
+    path:=true) path=true; path_explicit=true;;
+    path:=false) path=false; path_explicit=true;;
+    path:=*) echo "[FATAL] path must be true or false: $argument" >&2; exit 2;;
     config:=*) fastlio_config="${argument#config:=}";;
     driver:=*) echo '[FATAL] FAST-LIO正式入口固定使用NX本地驱动，不接受driver参数' >&2; exit 2;;
     --check) check=true;;
@@ -43,11 +67,39 @@ for argument in "$@"; do
   esac
 done
 
+# Do not change manual/AR interfaces merely because TARE's default changed.
+if [ "$path_explicit" = false ] && { [ "$navigation" != auto ] || [ "$exploration" != tare ]; }; then
+  path=false
+fi
+
+if [ "$path" = true ]; then
+  [ "$navigation" = auto ] && [ "$exploration" = tare ] || {
+    echo '[FATAL] path:=true requires navigation:=auto exploration:=tare' >&2; exit 2;
+  }
+  if [ "$extend" = true ]; then
+    echo '[PARAM] path mode follows the selected route; overriding extend:=true to false'
+  fi
+  extend=false
+fi
+
+python3 - "$vp" <<'PY'
+import math
+import sys
+try:
+    spacing = float(sys.argv[1])
+    assert math.isfinite(spacing) and spacing > 0
+except (ValueError, AssertionError):
+    sys.exit('[FATAL] vp must be a positive finite number in metres')
+PY
+
 fail() { echo "[FATAL] $*" >&2; exit 42; }
+tare_enabled=false
+[ "$navigation" != auto ] || [ "$exploration" != tare ] || tare_enabled=true
 mode=prone
 [ "$motion" = true ] && mode=stand
 [ -r "$fastlio_ws/devel/setup.bash" ] || fail "FAST-LIO workspace has not been built: $fastlio_ws"
 [ -r "$scan_ws/devel/setup.bash" ] || fail "SCAN official workspace has not been built: $scan_ws"
+[ "$tare_enabled" = false ] || [ -r "$tare_ws/devel/setup.bash" ] || fail "TARE workspace has not been built: $tare_ws"
 [ -r "$fastlio_config" ] || fail "missing FAST-LIO config: $fastlio_config"
 [ -r "$driver_config" ] || fail "missing Livox driver config: $driver_config"
 [ -r "$sensor_scan_ws/devel/setup.bash" ] || fail "sensor scan workspace has not been built: $sensor_scan_ws"
@@ -58,6 +110,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 source /opt/ros/noetic/setup.bash
 source "$fastlio_ws/devel/setup.bash"
 [ "$elevation" = false ] || source "$elevation_ws/devel/setup.bash" --extend
+[ "$tare_enabled" = false ] || source "$tare_ws/devel/setup.bash" --extend
 source "$scan_ws/devel/setup.bash" --extend
 source "$sensor_scan_ws/devel/setup.bash" --extend
 export PYTHONPATH="$scan_ws/devel/lib/python3/dist-packages:${PYTHONPATH:-}"
@@ -77,14 +130,22 @@ fi
 [ -x "$fastlio_ws/devel/lib/livox_ros_driver2/livox_ros_driver2_node" ] || fail 'missing Livox driver executable'
 [ -x "$scan_ws/devel/lib/scan_planner/scan_planner_node" ] || fail 'missing SCAN executable'
 [ "$elevation" = false ] || [ -x "$elevation_ws/devel/lib/elevation_mapping/elevation_mapping" ] || fail 'missing elevation_mapping executable'
+if [ "$tare_enabled" = true ]; then
+  [ "$(rospack find tare_planner)" = "$tare_ws/src/tare_planner" ] || fail 'wrong tare_planner package resolved'
+  for executable in tare_planner/tare_planner_node terrain_analysis/terrainAnalysis terrain_analysis_ext/terrainAnalysisExt; do
+    [ -x "$tare_ws/devel/lib/$executable" ] || fail "missing TARE executable: $executable"
+  done
+fi
 if [ "$motion" = true ]; then
   [ -x "$motion_ws/build/go2_standup" ] || fail 'missing RecoveryStand helper'
   [ -x "$motion_ws/build/cmd_vel_bridge" ] || fail 'missing Go2 cmd_vel bridge'
 fi
 
-echo "[FAST-LIO NX] navigation=$navigation motion=$motion mode=$mode elevation=$elevation ROS_IP=$ROS_IP"
-echo '[PARAM] FAST-LIO input/odom=10Hz; SCAN=current phase-1 parameters; AR map=2Hz, replan=1.5Hz, resolution=0.1m, range=5m'
-if [ "$elevation" = true ]; then
+echo "[FAST-LIO NX] navigation=$navigation exploration=$exploration motion=$motion mode=$mode elevation=$elevation continuous=$continuous ROS_IP=$ROS_IP"
+echo '[PARAM] FAST-LIO input/odom=10Hz; SCAN cloud=5Hz; max_v=.55 max_w=.80'
+if [ "$tare_enabled" = true ]; then
+  echo "[PARAM] TARE indoor 1Hz; vp=${vp}m (50x50); lookahead=4m, extend=${extend}; path=${path}; SCAN Z=current body Z"
+elif [ "$elevation" = true ]; then
   echo '[PARAM] elevation mode: official local elevation map drives AR; global display map=0.2m/0.5Hz/cap100000 cells'
 else
   echo '[PARAM] default 2-D mode: AR mapping Z is locked; SCAN samples current body Z once per new goal'
@@ -94,20 +155,22 @@ echo '[GUI] keep using ~/Go2/2D/launch_real_rviz.sh; legacy topics are preserved
 if [ "$check" = true ]; then
   roslaunch --nodes "$script_dir/fastlio_stack_NX.launch" \
     fastlio_config:="$fastlio_config" driver_config:="$driver_config" \
-    navigation_mode:="$navigation" mode:="$mode" rviz:="$rviz" elevation:="$elevation"
+    navigation_mode:="$navigation" mode:="$mode" rviz:="$rviz" elevation:="$elevation" continuous:="$continuous" exploration:="$exploration" vp:="$vp" extend:="$extend" path:="$path"
   exit 0
 fi
 
 mkdir -p "$log_dir"
 exec 9>"$log_dir/launcher.lock"
 flock -n 9 || fail 'another FAST-LIO navigation launcher owns the NX stack'
-if pgrep -f '[l]ivox_ros_driver2_node|[f]astlio_mapping|[p]ointlio_mapping|[s]can_planner_node|[c]losed_loop_controller|[c]md_vel_bridge|[r]l_planner.py|[o]ctomap_server_node|[f]astlio_output_adapter.py|[c]md_vel_safety_gate.py|[s]can_cloud_accumulator.py|[e]levation_mapping|[g]o2_elevation_products|[g]o2_elevation_visualization' >/dev/null; then
+if pgrep -f '[l]ivox_ros_driver2_node|[f]astlio_mapping|[p]ointlio_mapping|[s]can_planner_node|[c]losed_loop_controller|[c]md_vel_bridge|[r]l_planner.py|[o]ctomap_server_node|[f]astlio_output_adapter.py|[s]can_cloud_accumulator.py|[e]levation_mapping|[g]o2_elevation_products|[g]o2_elevation_visualization|[t]are_planner_node|[t]errainAnalysis|[t]are_input_bridge.py|[t]are_scan_bridge.py' >/dev/null; then
   fail 'a local LiDAR/SLAM/navigation process is already active; stop its owning launcher first'
 fi
 
-# Mandatory real-run order: synchronize before roscore/driver/FAST-LIO starts.
-timeout 60 python3 "$script_dir/sync_mid360_clock.py" | tee "$log_dir/clock.log" \
-  || fail 'NX -> 3908 -> PHC -> MID360 clock synchronization failed'
+# NX receives LiDAR directly, but the board is MID360's PTP master.
+# Align the idle board system/PHC before acquisition; never rewrite ROS stamps.
+timeout 60 python3 "$script_dir/sync_mid360_clock.py" 2>&1 \
+  | tee "$log_dir/clock.log" \
+  || fail 'NX -> board -> PHC -> MID360 clock synchronization failed'
 
 # FAST-LIO fixes its map origin at startup. For motion=true, issue one
 # RecoveryStand command and wait for that command helper to finish before
@@ -160,7 +223,7 @@ fi
 
 start stack.log roslaunch "$script_dir/fastlio_stack_NX.launch" \
   fastlio_config:="$fastlio_config" driver_config:="$driver_config" \
-  navigation_mode:="$navigation" mode:="$mode" rviz:="$rviz" elevation:="$elevation"
+  navigation_mode:="$navigation" mode:="$mode" rviz:="$rviz" elevation:="$elevation" continuous:="$continuous" exploration:="$exploration" vp:="$vp" extend:="$extend" path:="$path"
 stack_pid="${pids[-1]}"
 wait_topic() {
   local topic="$1"
@@ -178,7 +241,14 @@ wait_topic /Odometry 20 || fail 'no FAST-LIO odometry; inspect stack.log'
 wait_topic /LIO/clouds_lidar 20 || fail 'FAST-LIO adapter did not publish SCAN cloud'
 wait_topic /LIO/odom_vehicle 10 || fail 'FAST-LIO adapter did not publish vehicle odometry'
 wait_topic /grid_map/occupancy 30 || fail 'SCAN did not publish its official occupancy map'
-wait_topic /projected_map 30 || fail 'AR map did not publish /projected_map'
+if [ "$tare_enabled" = false ]; then
+  wait_topic /projected_map 30 || fail 'display map did not publish /projected_map'
+fi
+if [ "$tare_enabled" = true ]; then
+  wait_topic /tare/registered_scan 20 || fail 'TARE same-stamp input is missing'
+  wait_topic /tare/terrain_map 30 || fail 'official TARE local terrain map is missing'
+  wait_topic /tare/terrain_map_ext 30 || fail 'official TARE extended terrain map is missing'
+fi
 if [ "$elevation" = true ]; then
   wait_topic /local_elevation_map 30 || fail 'elevation mode did not publish /local_elevation_map'
   wait_topic /global_elevation_map 30 || fail 'elevation mode did not publish /global_elevation_map'
@@ -187,22 +257,29 @@ python3 "$script_dir/check_odom_health.py" _topic:=/Odometry _duration:=8.0 \
   _min_rate:=8.0 _max_gap:=0.2 _max_age:=0.5 _max_future:=0.05 _min_stamp_progress:=0.9 \
   || fail 'FAST-LIO odometry health check failed'
 
-start_console navigation_status.log python3 "$script_dir/navigation_status_monitor.py"
+start_console navigation_status.log python3 "$script_dir/navigation_status_monitor.py" _exploration:="$exploration"
 
-echo '[READY] FAST-LIO、SCAN和AR地图已就绪；GUI接口保持不变'
+echo "[READY] FAST-LIO、SCAN和所选地图已就绪；exploration=$exploration"
 if [ "$navigation" = auto ]; then
-  echo '[READY] AR自动探索决策已启用（1.5Hz）'
+  if [ "$exploration" = tare ]; then
+    echo '[READY] TARE室内探索已选择（1Hz）；AR建图和决策均关闭'
+  else
+    echo '[READY] AR自动探索决策已启用（1.5Hz）'
+  fi
 else
   echo '[READY] AR仅建图；请在RViz使用2D Nav Goal发送SCAN手动目标'
 fi
 
 if [ "$motion" = true ]; then
-  start cmd_vel_bridge.log "$motion_ws/build/cmd_vel_bridge" _interface:=eth10 _auto_stand:=false \
-    _disable_avoid:=false _cmd_timeout_s:=0.5 _max_linear_speed:=0.5 _max_angular_speed:=0.8
+  start cmd_vel_bridge.log "$motion_ws/build/cmd_vel_bridge" _interface:=eth10 _cmd_timeout_s:=0.5
 else
   echo '[SAFE] motion=false：未调用RecoveryStand，未启动Unitree运动桥'
 fi
 rosparam set /ariadne/execution_ready true
+rosparam set /exploration/execution_ready true
+if [ "$tare_enabled" = true ]; then
+  start tare_start.log rostopic pub -l /tare/start_exploration std_msgs/Bool 'data: true'
+fi
 if [ "$record_bag" = true ]; then
   start rosbag.log rosbag record -O "$log_dir/fastlio_$(date +%Y%m%d_%H%M%S).bag" \
     /livox/lidar /livox/imu /Odometry /cloud_registered /LIO/clouds_lidar \

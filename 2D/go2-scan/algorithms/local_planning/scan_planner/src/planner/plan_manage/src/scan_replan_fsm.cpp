@@ -96,10 +96,10 @@ namespace scan_planner
     have_new_target_ = false;
     rviz_height_ready_ = false;
     go2_execution_frozen_ = false;
+    last_freeze_update_time_ = ros::Time::now();
     flag_escape_emergency_ = true;
     need_hover_stop_ = false;
     replan_fail_count_ = 0;
-    last_freeze_update_time_ = ros::Time::now();
 
     /*  fsm param  */
     nh.param("fsm/navi_mode", navi_mode_, -1);
@@ -111,6 +111,7 @@ namespace scan_planner
     nh.param("fsm/max_replan_fail_count", max_replan_fail_count_, 1000);
     nh.param("fsm/goal_feedback", feedback_enabled_, false);
     nh.param("fsm/use_path_height", use_path_height_, false);
+    nh.param("fsm/adjust_occupied_target", adjust_occupied_target_, false);
     ros::param::param("/closed_loop_controller/finish_dist", finish_distance_, 0.6);
     if (feedback_enabled_)
     {
@@ -227,6 +228,14 @@ namespace scan_planner
     if (!rviz_height_ready_)
     {
       ROS_WARN("[SCANReplanFSM] Ignore RViz goal before receiving initial body pose.");
+      if (feedback_enabled_ && !msg->header.stamp.isZero())
+      {
+        scan_planner::GoalFeedback result;
+        result.request_header = msg->header;
+        result.state = scan_planner::GoalFeedback::FAILED;
+        result.reason = "INVALID_OR_NOT_READY";
+        goal_feedback_pub_.publish(result);
+      }
       return;
     }
 
@@ -242,6 +251,36 @@ namespace scan_planner
     {
       ROS_WARN_THROTTLE(1.0, "[waypointCallback] Empty waypoint message, ignore.");
       return;
+    }
+
+    // In simulation-compatible navi_mode=1, treat the request as a tracked
+    // exploration goal too.  The entity bridge waits for this terminal result
+    // before it forwards its latest cached TARE intent.
+    if (feedback_enabled_ && !msg->header.stamp.isZero())
+    {
+      if (msg->header.stamp <= goal_feedback_.request_header.stamp)
+      {
+        goal_feedback_pub_.publish(goal_feedback_);
+        return;
+      }
+      if (goal_tracking_)
+        finishGoal(scan_planner::GoalFeedback::FAILED, "REPLACED");
+      goal_feedback_ = scan_planner::GoalFeedback();
+      goal_feedback_.request_header = msg->header;
+      goal_feedback_.state = scan_planner::GoalFeedback::ACTIVE;
+      goal_tracking_ = true;
+      fail_since_ = reached_since_ = 0;
+      finished_traj_ = -1;
+      if (!have_odom_ || msg->header.frame_id != "world")
+      {
+        finishGoal(scan_planner::GoalFeedback::FAILED, "INVALID_OR_NOT_READY");
+        return;
+      }
+      if (!std::isfinite(msg->poses[0].pose.position.x) || !std::isfinite(msg->poses[0].pose.position.y))
+      {
+        finishGoal(scan_planner::GoalFeedback::FAILED, "INVALID_TARGET");
+        return;
+      }
     }
 
     if (msg->poses[0].pose.position.z < -0.1)
@@ -292,6 +331,8 @@ namespace scan_planner
     else
     {
       ROS_ERROR("Unable to generate global trajectory!");
+      if (goal_tracking_)
+        finishGoal(scan_planner::GoalFeedback::FAILED, "GLOBAL_PLAN_FAILED");
     }
   }
 
@@ -414,6 +455,14 @@ namespace scan_planner
     if (final_occ <= 0)
       return true;
 
+    if (!adjust_occupied_target_)
+    {
+      ROS_WARN("[global target] Requested target is occupied by the current inflated map; reject without changing the target.");
+      return false;
+    }
+
+    // Match the GUI simulation: shorten an occupied endpoint to a free
+    // point on the reference. The local planner still checks the actual path.
     for (int i = sample_num; i >= 0; --i)
     {
       const double t = duration * i / sample_num;

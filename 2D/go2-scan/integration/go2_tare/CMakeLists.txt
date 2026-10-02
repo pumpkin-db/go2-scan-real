@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.0.2)
+project(go2_tare)
+find_package(catkin REQUIRED)
+catkin_package()
+catkin_install_python(PROGRAMS scripts/tare_input_bridge.py scripts/tare_scan_bridge.py scripts/tare_observer.py DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+install(DIRECTORY launch DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})

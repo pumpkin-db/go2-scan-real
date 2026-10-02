@@ -8,7 +8,7 @@ import rospy
 from geometry_msgs.msg import PointStamped, Twist
 from nav_msgs.msg import Odometry, Path
 from scan_planner.msg import Bspline, GoalFeedback
-from std_msgs.msg import String
+from std_msgs.msg import String, Time
 
 
 def key(stamp):
@@ -17,13 +17,25 @@ def key(stamp):
 
 class Monitor:
     def __init__(self):
+        self.explorer = str(rospy.get_param("~exploration", "ariadne")).upper()
         self.robot = None
+        self.tare_status_time = 0.0
+        self.tare_finished = None
+        self.tare_diagnostic = None
+        self.tare_waiting = False
+        self.tare_goal_stamp = None
+        self.tare_line_time = 0.0
+        rospy.Subscriber("/tare/diagnostics", String, self.tare_diag_cb, queue_size=1)
+        if self.explorer == 'TARE':
+            rospy.Subscriber('/tare/goal_result', Time, self.tare_result_cb, queue_size=5)
         self.raw_id = None
         self.raw_target = None
         self.raw_time = 0.0
         self.path_time = 0.0
+        self.path_id = None
         self.scan_id = None
         self.scan_state = None
+        self.scan_feedback_time = 0.0
         self.distance = 0.0
         self.traj = -1
         self.active_since = 0.0
@@ -31,28 +43,42 @@ class Monitor:
         self.progress_time = 0.0
         self.stall_print = 0.0
         self.cmd = (0.0, 0.0, 0.0)
-        self.gate = "UNKNOWN"
         self.ar_reason = None
         self.ar_reason_time = 0.0
         self.decision_signature = None
         self.decision_time = 0.0
         self.ar_status = None
         rospy.Subscriber("/LIO/odom_vehicle", Odometry, self.odom_cb, queue_size=2)
-        rospy.Subscriber("/way_point", PointStamped, self.ar_target_cb, queue_size=5)
+        target_topic = '/tare/way_point' if self.explorer == 'TARE' else '/way_point'
+        rospy.Subscriber(target_topic, PointStamped, self.ar_target_cb, queue_size=5)
         rospy.Subscriber("/initial_path", Path, self.path_cb, queue_size=5)
         rospy.Subscriber("/scan/goal_feedback", GoalFeedback, self.scan_cb, queue_size=20)
         rospy.Subscriber("/planning/bspline", Bspline, self.traj_cb, queue_size=5)
         rospy.Subscriber("/cmd_vel", Twist, self.cmd_cb, queue_size=5)
-        rospy.Subscriber("/cmd_vel_gate/status", String, self.gate_cb, queue_size=5)
         rospy.Subscriber("/ariadne/status", String, self.ar_status_cb, queue_size=5)
         rospy.Subscriber("/ariadne/diagnostic", String, self.ar_diag_cb, queue_size=10)
         rospy.Subscriber("/ariadne/bridge/diagnostic", String, self.bridge_diag_cb, queue_size=10)
         rospy.Timer(rospy.Duration(1.0), self.timer_cb)
-        self.out("[诊断] 导航监视器已启动：AR目标 -> 目标桥 -> SCAN -> 控制器")
+        self.out("[导航] %s → SCAN 状态监视已启动" % self.explorer)
 
     @staticmethod
     def out(text):
         print(time.strftime("%H:%M:%S") + " " + text, flush=True)
+
+    def tare_diag_cb(self, msg):
+        if self.explorer != 'TARE':
+            return
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        self.tare_diagnostic = d
+        self.tare_status_time = time.monotonic()
+        self.tare_finished = bool(d.get('finished'))
+
+    def tare_result_cb(self, msg):
+        if self.tare_goal_stamp == key(msg.data):
+            self.tare_waiting = False
 
     def odom_cb(self, msg):
         p = msg.pose.pose.position
@@ -66,11 +92,16 @@ class Monitor:
         self.ar_reason = None  # 新目标后，同一等待原因若再次出现也要重新显示
         self.raw_target = (msg.point.x, msg.point.y, msg.point.z)
         self.raw_time = time.monotonic()
+        if self.explorer == 'TARE':
+            self.tare_goal_stamp = request_id
+            self.tare_waiting = True
+            self.out('[TARE] 发目标 (%.2f, %.2f)，等待SCAN反馈' % (msg.point.x, msg.point.y))
+            return
         distance = "NA"
         if self.robot is not None:
             distance = "%.2fm" % math.hypot(msg.point.x-self.robot[0], msg.point.y-self.robot[1])
-        self.out("[AR目标] id=%d target=(%.2f, %.2f, %.2f) distance=%s" %
-                 (request_id, msg.point.x, msg.point.y, msg.point.z, distance))
+        self.out("[%s目标] id=%d target=(%.2f, %.2f, %.2f) distance=%s" %
+                 (self.explorer, request_id, msg.point.x, msg.point.y, msg.point.z, distance))
 
     def path_cb(self, msg):
         if len(msg.poses) < 2:
@@ -79,6 +110,11 @@ class Monitor:
         start = msg.poses[0].pose.position
         goal = msg.poses[-1].pose.position
         self.path_time = time.monotonic()
+        self.path_id = key(msg.header.stamp)
+        if self.explorer == 'TARE':
+            self.out('[SCAN] 收到目标 (%.2f, %.2f)，路径 %.1fm' %
+                     (goal.x, goal.y, math.hypot(goal.x-start.x, goal.y-start.y)))
+            return
         self.out("[目标桥] 已交给SCAN attempt=%d goal=(%.2f, %.2f, %.2f) path=%.2fm" %
                  (key(msg.header.stamp), goal.x, goal.y, goal.z,
                   math.hypot(goal.x-start.x, goal.y-start.y)))
@@ -91,34 +127,36 @@ class Monitor:
         self.distance = msg.distance_xy
         self.traj = msg.traj_id
         now = time.monotonic()
+        self.scan_feedback_time = now
         if msg.state == GoalFeedback.ACTIVE:
             if changed:
                 self.active_since = now
                 self.progress_distance = msg.distance_xy
                 self.progress_time = now
                 p = msg.effective_goal
-                self.out("[SCAN] 已接收目标 id=%d goal=(%.2f, %.2f, %.2f) distance=%.2fm" %
-                         (request_id, p.x, p.y, p.z, msg.distance_xy))
+                if self.explorer == 'TARE':
+                    self.out('[SCAN] 执行中，目标 (%.2f, %.2f)，剩余 %.2fm' %
+                             (p.x, p.y, msg.distance_xy))
+                else:
+                    self.out("[SCAN] 已接收目标 id=%d goal=(%.2f, %.2f, %.2f) distance=%.2fm" %
+                             (request_id, p.x, p.y, p.z, msg.distance_xy))
             elif self.progress_distance is None or msg.distance_xy < self.progress_distance-0.05:
                 self.progress_distance = msg.distance_xy
                 self.progress_time = now
         elif changed:
             label = "到达" if msg.state == GoalFeedback.SUCCEEDED else "失败"
-            self.out("[SCAN结果] %s id=%d reason=%s distance=%.3fm traj=%d" %
-                     (label, request_id, msg.reason, msg.distance_xy, msg.traj_id))
+            if self.explorer == 'TARE':
+                self.out('[SCAN] %s：%s，目标剩余 %.2fm；交回TARE' %
+                         (label, msg.reason, msg.distance_xy))
+            else:
+                self.out("[SCAN结果] %s id=%d reason=%s distance=%.3fm traj=%d" %
+                         (label, request_id, msg.reason, msg.distance_xy, msg.traj_id))
 
     def traj_cb(self, msg):
         self.traj = msg.traj_id
 
     def cmd_cb(self, msg):
         self.cmd = (math.hypot(msg.linear.x, msg.linear.y), msg.angular.z, time.monotonic())
-
-    def gate_cb(self, msg):
-        if msg.data != self.gate:
-            previous = self.gate
-            self.gate = msg.data
-            if msg.data != "READY" or previous not in ("UNKNOWN", "READY"):
-                self.out("[安全门] %s -> %s" % (previous, msg.data))
 
     def ar_status_cb(self, msg):
         if msg.data != self.ar_status:
@@ -182,32 +220,69 @@ class Monitor:
             return
         event = data.get("event")
         if event == "NO_CANDIDATE":
-            self.out("[目标桥] 拒绝：AR目标附近没有满足距离和净空条件的候选点 requested=(%.2f, %.2f)" %
-                     (data.get("requested_x", 0.0), data.get("requested_y", 0.0)))
-        elif event == "REJECT_UNSAFE":
-            self.out("[目标桥] 拒绝：目标附近无安全点 requested=(%.2f, %.2f) clearance>%.2fm" %
+            age = data.get("local_map_age")
+            age_text = "NA" if age is None else "%.2fs" % float(age)
+            self.out("[目标桥] 拒绝：AR目标附近没有满足距离和净空条件的候选点 "
+                     "requested=(%.2f, %.2f) local_age=%s local_points=%s" %
                      (data.get("requested_x", 0.0), data.get("requested_y", 0.0),
-                      data.get("required_clearance", 0.0)))
+                      age_text, data.get("local_obstacle_points", "?")))
+        elif event == "REJECT_UNSAFE":
+            age = data.get("local_map_age")
+            age_text = "NA" if age is None else "%.2fs" % float(age)
+            self.out("[目标桥] 拒绝：目标附近无安全点 requested=(%.2f, %.2f) "
+                     "clearance>%.2fm local_age=%s local_points=%s" %
+                     (data.get("requested_x", 0.0), data.get("requested_y", 0.0),
+                      data.get("required_clearance", 0.0), age_text,
+                      data.get("local_obstacle_points", "?")))
         elif event == "FORWARDED":
             clearance = data.get("clearance")
             clearance_text = "NA" if clearance is None else "%.2fm" % float(clearance)
-            self.out("[目标桥] 安全目标=(%.2f, %.2f) requested=(%.2f, %.2f) clearance=%s retry=%s" %
+            self.out("[目标桥] 安全目标=(%.2f, %.2f) requested=(%.2f, %.2f) "
+                     "clearance=%s source=%s retry=%s" %
                      (data.get("target_x", 0.0), data.get("target_y", 0.0),
                       data.get("requested_x", 0.0), data.get("requested_y", 0.0),
-                      clearance_text, data.get("retry", 0)))
+                      clearance_text, data.get("clearance_source", "legacy"),
+                      data.get("retry", 0)))
 
     def timer_cb(self, _):
         now = time.monotonic()
+        if self.explorer == 'TARE':
+            if now-self.tare_line_time < 3.0:
+                return
+            self.tare_line_time = now
+            d = self.tare_diagnostic
+            if d is None or now-self.tare_status_time > 5.0:
+                tare = '等待SCAN反馈' if self.tare_waiting else '规划诊断未更新'
+                counts = ''
+            else:
+                if self.tare_waiting:
+                    tare = '等待SCAN反馈'
+                elif d.get('finished'):
+                    tare = '已结束' if d.get('at_home') else '返航规划'
+                else:
+                    tare = '规划下个目标'
+                counts = ' 候选=%s' % d.get('candidate_count', '?')
+                if d.get('coverage_updated'):
+                    counts += ' 前沿=%s' % d.get('uncovered_frontier_count', '?')
+                else:
+                    counts += ' 覆盖统计停更'
+            if self.scan_state == GoalFeedback.ACTIVE and now-self.scan_feedback_time > 2.0:
+                scan = '反馈中断（上次为执行中）'
+            elif self.scan_state == GoalFeedback.ACTIVE:
+                scan = ('执行中 剩余=%.2fm 速度=%.2fm/s 转速=%.2frad/s' %
+                        (self.distance, self.cmd[0], self.cmd[1]))
+            else:
+                scan = '等待目标'
+            self.out('[状态] TARE=%s | SCAN=%s%s' % (tare, scan, counts))
+            return
         if self.scan_state == GoalFeedback.ACTIVE:
-            self.out("[执行中] distance=%.2fm traj=%d cmd_linear=%.2f cmd_yaw=%.2f gate=%s goal_age=%.1fs" %
+            self.out("[执行中] distance=%.2fm traj=%d cmd_linear=%.2f cmd_yaw=%.2f goal_age=%.1fs" %
                      (self.distance, self.traj, self.cmd[0], self.cmd[1],
-                      self.gate, now-self.active_since))
+                      now-self.active_since))
             if now-self.progress_time >= 4.0 and now-self.stall_print >= 4.0:
                 self.stall_print = now
                 command_age = now-self.cmd[2]
-                if self.gate != "READY":
-                    self.out("[卡住判断] 安全门未放行：" + self.gate)
-                elif command_age > 0.5:
+                if command_age > 0.5:
                     self.out("[卡住判断] 控制器命令超时，SCAN目标仍为ACTIVE")
                 elif self.cmd[0] < 0.03 and abs(self.cmd[1]) < 0.05:
                     self.out("[卡住判断] SCAN目标仍为ACTIVE，但闭环控制器输出零速度")
@@ -215,8 +290,9 @@ class Monitor:
                     self.out("[转向中] 当前主要原地转向，XY距离暂未下降")
                 else:
                     self.out("[卡住判断] 控制命令非零，但目标XY距离连续4秒未明显下降")
-        elif self.raw_time > self.path_time and now-self.raw_time >= 2.0:
-            self.out("[卡住判断] AR已经发目标，但目标桥2秒内没有交给SCAN")
+        elif (self.raw_time > self.path_time and now-self.raw_time >= 2.0 and
+              not (self.explorer == 'TARE' and self.raw_id == self.path_id)):
+            self.out("[卡住判断] %s已经发目标，但目标桥2秒内没有交给SCAN" % self.explorer)
             self.path_time = self.raw_time
 
 

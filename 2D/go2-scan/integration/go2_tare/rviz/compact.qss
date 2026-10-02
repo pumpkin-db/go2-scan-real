@@ -1,0 +1,2 @@
+/* RViz display/topic tree only; scene marker sizes are unchanged. */
+QTreeView { font-size: 10pt; }

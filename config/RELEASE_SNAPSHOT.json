@@ -1,0 +1,39 @@
+{
+  "time": "2026-10-03T00:25+08:00",
+  "source_host": "NX ubuntu",
+  "baseline_commit": "3a9c302cfdbc74ce936c3b56ea88f26cef4d1a47",
+  "source_roots": [
+    "2D/FAST-LIO/src",
+    "2D/SENSOR-SCAN/src",
+    "2D/go2-scan/algorithms/local_planning/scan_planner/src",
+    "2D/go2-scan/algorithms/global_planning/ariadne",
+    "2D/go2-scan/algorithms/elevation_mapping",
+    "2D/go2-scan/integration/go2_bridge",
+    "2D/go2-scan/integration/go2_motion",
+    "2D/go2-scan/integration/go2_tare",
+    "2D/go2-scan/algorithms/global_planning/tare_planner/src",
+    "2D/go2-scan/algorithms/global_planning/tare_planner/README.md",
+    "2D/launch_real_rviz.sh",
+    "2D/go2-scan/real/CMakeLists.txt",
+    "2D/go2-scan/real/package.xml",
+    "2D/go2-scan/real/launch_fastlio_NX.sh",
+    "2D/go2-scan/real/launch_fastlio_for_scan-planner_NX.sh",
+    "2D/go2-scan/real/fastlio_stack_NX.launch",
+    "2D/go2-scan/real/fastlio_output_adapter.py",
+    "2D/go2-scan/real/check_odom_health.py",
+    "2D/go2-scan/real/sync_mid360_clock.py",
+    "2D/go2-scan/real/navigation_status_monitor.py"
+  ],
+  "backup": "/home/unitree/Go2/backups/real_release_before_20261003_002548",
+  "validation": {
+    "isolated_build": "passed: FAST-LIO, driver, sensor scan, elevation, SCAN, TARE/terrain, motion bridge",
+    "preflight": "passed: TARE path/single-goal, AR, manual, elevation; includes motion=true --check only",
+    "tests": [
+      "TARE execution path corner/order/validation",
+      "TARE -> SCAN latest-intent handoff"
+    ],
+    "source_identity": "all checked deployed files are byte-identical; no runtime code edits",
+    "hardware": "not started; post-clock-sync end-to-end real run remains pending"
+  },
+  "validated_at": "2026-10-03T00:46+08:00"
+}

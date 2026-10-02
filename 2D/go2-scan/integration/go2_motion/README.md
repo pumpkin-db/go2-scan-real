@@ -1,4 +1,4 @@
-# cmd_vel_bridge — ROS1 /cmd_vel → Go2 CycloneDDS 直通桥（第一轮安全版）
+# cmd_vel_bridge — ROS1 /cmd_vel → Go2 CycloneDDS 直通桥
 
 从 `~/cmd_vel_bridge` 迁移。绕开 ROS2/ros1_bridge/Fast-DDS，把 ROS1 `/cmd_vel`
 (geometry_msgs/Twist) 经 `unitree_sdk2` + CycloneDDS 直发 Go2 `/api/sport/request`。
@@ -15,19 +15,14 @@
 ## 第一轮 bridge 参数（默认已安全）
 ```bash
 ~/Go2/2D/go2-scan/integration/go2_motion/build/cmd_vel_bridge \
-  _interface:=eth10 _auto_stand:=false _disable_avoid:=false _max_linear_speed:=0.5
+  _interface:=eth10 _cmd_timeout_s:=0.5
 ```
 
-- `_auto_stand:=false`：默认**不自动站立**（狗已先站好；需要时 `_auto_stand:=true` 会 RecoveryStand）。
-- `_disable_avoid:=false`：默认**保持 Go2 原生避障开启**，不调用 `SwitchSet(false)`。
-- `_max_linear_speed:=0.5`：平面速度模长硬限 0.5 m/s（超按比例缩放保持方向）。
-- `_max_angular_speed:=0.5`：angular.z 硬限 0.5 rad/s（SCAN 上限 kMaxVYawLimit=1.0）。
-
-## 安全确认后再考虑
-```bash
-_max_linear_speed:=0.75
-```
-（升速前先确认原生避障开启下运动稳定。）
+- 站立由正式启动脚本在启动传感器前统一处理，运动桥不再重复处理姿态。
+- 运动桥不修改 Go2 原生避障状态。
+- SCAN 的速度原样传给 `SportClient::Move()`，不再设置第二套速度死区。
+- 运动桥不再二次裁剪线速度和角速度，原样转发SCAN命令；速度上限统一由SCAN配置负责。
+- 只保留命令超时、非有限值拒绝、明确零速和退出时`StopMove()`。
 
 ## 编译（沿用旧工程方式）
 ```bash

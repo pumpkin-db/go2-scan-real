@@ -2,7 +2,7 @@
 # 一键打开 RViz 连 NX 的 real 链，接收实时数据。
 # 前置：NX 已运行 `bash ~/Go2/2D/go2-scan/real/launch_real.sh`（算法链已起）。
 # 用法：bash launch_real_rviz.sh [NX_IP] [elevation:=true|false]
-#   NX_IP 默认取手机热点地址 10.249.138.228（热点变化时可传参覆盖）
+#   NX_IP 默认取手机热点地址 10.139.131.228（热点变化时可传参覆盖）
 #   elevation 默认 false；只有显式 true 才加载两个高程显示。
 set -e
 
@@ -11,7 +11,7 @@ set -e
 # 导致 go2_description/livox 网格找不到、go2_robot 报 error。
 source /opt/ros/noetic/setup.bash
 
-NX_IP="10.249.138.228"
+NX_IP="10.139.131.228"
 elevation=false
 for argument in "$@"; do
   case "$argument" in
@@ -170,6 +170,61 @@ def replace_or_add(display):
                    if not (isinstance(item, dict) and
                            item.get('Name') == display['Name'])]
     displays.append(display)
+
+# GitHub基线的/frontier只有x/y/z字段，没有逐点rgb字段；
+# 使用固定红色显示，避免RGB8找不到字段时回退成白色。
+frontier_display = {
+    'Alpha': 1,
+    'Autocompute Intensity Bounds': True,
+    'Class': 'rviz/PointCloud2',
+    'Color': '204; 0; 0',
+    'Color Transformer': 'FlatColor',
+    'Decay Time': 0,
+    'Enabled': True,
+    'Name': 'Frontier',
+    'Position Transformer': 'XYZ',
+    'Queue Size': 10,
+    'Selectable': True,
+    'Size (Pixels)': 3,
+    'Size (m)': 0.30,
+    'Style': 'Flat Squares',
+    'Topic': '/frontier',
+    'Unreliable': False,
+    'Use Fixed Frame': True,
+    'Use rainbow': False,
+    'Value': True,
+}
+
+# AR原始目标仍由/way_point显示为紫色；桥实际改选的目标单独显示为绿色球。
+# 球的0.4m半径由Marker消息自身的0.8m直径定义，SCAN白点保持独立。
+bridge_adjusted_goal_display = {
+    'Class': 'rviz/Marker',
+    'Enabled': True,
+    'Marker Topic': '/ariadne/bridge/adjusted_goal',
+    'Name': 'AR Bridge Adjusted Goal (Green)',
+    'Namespaces': {'ariadne_bridge_adjusted_goal': True},
+    'Queue Size': 10,
+    'Value': True,
+}
+
+frontier_matches = []
+def find_frontier(value):
+    if isinstance(value, dict):
+        if value.get('Topic') == '/frontier':
+            frontier_matches.append(value)
+        for child in value.values():
+            find_frontier(child)
+    elif isinstance(value, list):
+        for child in value:
+            find_frontier(child)
+find_frontier(displays)
+if frontier_matches:
+    for match in frontier_matches:
+        match.update(frontier_display)
+else:
+    displays.append(frontier_display)
+
+replace_or_add(bridge_adjusted_goal_display)
 
 if elevation:
     replace_or_add(local_elevation)

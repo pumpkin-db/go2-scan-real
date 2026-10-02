@@ -1,0 +1,11 @@
+<package format="2">
+  <name>go2_tare</name><version>0.1.0</version>
+  <description>Official TARE inputs and SCAN waypoint integration.</description>
+  <maintainer email="pumpkin@example.com">pumpkin</maintainer><license>BSD-3-Clause</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <exec_depend>rospy</exec_depend><exec_depend>message_filters</exec_depend>
+  <exec_depend>nav_msgs</exec_depend><exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend><exec_depend>std_msgs</exec_depend>
+  <exec_depend>scan_planner</exec_depend><exec_depend>tare_planner</exec_depend>
+  <exec_depend>terrain_analysis</exec_depend><exec_depend>terrain_analysis_ext</exec_depend>
+</package>

@@ -24,3 +24,7 @@ config/local/*
 
 # Explicitly retired from the real release.
 2D/POINT-LIO/
+
+# Generated optional workspace; sources live under algorithms/elevation_mapping.
+2D/ELEVATION-MAPPING/
+**/.catkin_workspace

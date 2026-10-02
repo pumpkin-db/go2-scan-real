@@ -15,6 +15,7 @@
   <!-- public parameters -->
   <arg name="max_vel" default="0.75"/>
   <arg name="max_acc" default="0.5"/>
+  <arg name="max_vyaw" default="1.0"/>
   <arg name="planning_horizon" default="3.5"/>
   <arg name="use_path_height" default="false"/>
   <arg name="body_height" default="0.4"/>
@@ -46,8 +47,8 @@
     <param name="grid_map/sliding_map_size_y" value="10.0" />
     <param name="grid_map/sliding_map_size_z" value="5.0" />
     <param name="grid_map/map_sliding_thresh" value="0.2"/>
-    <param name="grid_map/double_cylinder_radius" value="0.29" />
-    <param name="grid_map/double_cylinder_offset" value="0.18" />
+    <param name="grid_map/double_cylinder_radius" value="0.25" />
+    <param name="grid_map/double_cylinder_offset" value="0.20" />
     <param name="grid_map/obstacles_inflation_z_up" value="0.1" />
     <param name="grid_map/obstacles_inflation_z_down" value="0.1" />
     <param name="grid_map/body_height" value="$(arg body_height)" />
@@ -98,13 +99,12 @@
 
   <!-- trajectory tracking -->
   <param name="closed_loop_controller/time_forward" value="0.8" type="double"/>
-  <param name="closed_loop_controller/heading_error_threshold" value="0.6" type="double"/>
-  <param name="closed_loop_controller/heading_slowdown_start" value="0.2" type="double"/>
+  <param name="closed_loop_controller/heading_error_threshold" value="0.8" type="double"/>
   <param name="closed_loop_controller/kp_pos" value="0.8" type="double"/>
   <param name="closed_loop_controller/kp_yaw" value="1.5" type="double"/>
   <param name="closed_loop_controller/max_vx" value="$(arg max_vel)" type="double"/>
   <param name="closed_loop_controller/max_vy" value="0.35" type="double"/>
-  <param name="closed_loop_controller/max_vyaw" value="1.0" type="double"/>
+  <param name="closed_loop_controller/max_vyaw" value="$(arg max_vyaw)" type="double"/>
   <param name="closed_loop_controller/finish_dist" value="0.6" type="double"/>
 
 </launch>

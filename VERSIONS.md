@@ -14,3 +14,14 @@ local MID360/NX integration changes. Original licenses remain beside each tree.
   installed by `setup_nx.sh`)
 
 Point-LIO is intentionally excluded. The real stack uses NX-local FAST-LIO.
+
+- TARE upstream: `caochao39/tare_planner` at
+  `44500592b86138257273e0cab264e6a847ccefc7`, with the deployed NX modifications.
+- TARE OR-Tools: Google ARM64 Debian 11 C++ release `v9.8.3296`; the working
+  `include/` and `lib/` directories are bundled (Apache-2.0 license included).
+- CMU `terrain_analysis` and `terrain_analysis_ext`: deployed source bundled in
+  the TARE workspace, derived from the Autonomous Exploration Development
+  Environment. Their original package metadata and source notices are retained.
+
+Local source changes are recorded by Git in this release; the upstream commit
+list describes bases, not an assertion that the deployed source is unmodified.

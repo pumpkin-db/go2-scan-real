@@ -23,13 +23,15 @@ from collections import deque
 import rospy
 from geometry_msgs.msg import PointStamped, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Bool, Float64, String
+from visualization_msgs.msg import Marker
 
 
 class WaypointBridge(object):
     def __init__(self):
         self.repub_dist = float(rospy.get_param('~repub_dist', 0.5))
-        self.target_min_clearance = float(rospy.get_param('~target_min_clearance', 0.30))
+        self.target_min_clearance = float(rospy.get_param('~target_min_clearance', 0.40))
         self.target_min_robot_distance = float(rospy.get_param(
             '~target_min_robot_distance', 0.0))
         self.target_search_radius = float(rospy.get_param('~target_search_radius', 5.0))
@@ -39,12 +41,33 @@ class WaypointBridge(object):
         self.elevation_max_distance = float(rospy.get_param(
             '~elevation_max_distance', 0.20))
         self.body_pose_topic = rospy.get_param('~body_pose_topic', '/LIO/odom_vehicle')
+        # Exploration needs the accumulated projected map, while endpoint
+        # safety should prefer SCAN's rolling map. OctoMap has no point TTL,
+        # so temporary obstacles may otherwise block a historical return path.
+        self.local_clearance_topic = rospy.get_param(
+            '~local_clearance_topic', '/grid_map/occupancy')
+        self.local_clearance_max_age = float(rospy.get_param(
+            '~local_clearance_max_age', 1.0))
+        self.local_clearance_max_robot_distance = float(rospy.get_param(
+            '~local_clearance_max_robot_distance', 4.5))
+        self.local_clearance_voxel_size = float(rospy.get_param(
+            '~local_clearance_voxel_size', 0.05))
+        self.local_obstacle_min_height = float(rospy.get_param(
+            '~local_obstacle_min_height', 0.20))
+        self.local_obstacle_max_height = float(rospy.get_param(
+            '~local_obstacle_max_height', 0.80))
         if self.target_min_clearance < 0.0:
             raise ValueError('target_min_clearance must be non-negative')
         if self.target_min_robot_distance < 0.0:
             raise ValueError('target_min_robot_distance must be non-negative')
         if self.target_search_radius < self.target_min_clearance:
             raise ValueError('target_search_radius must be >= target_min_clearance')
+        if self.local_clearance_max_age <= 0.0 \
+                or self.local_clearance_max_robot_distance <= 0.0 \
+                or self.local_clearance_voxel_size <= 0.0:
+            raise ValueError('local clearance age/range/voxel must be positive')
+        if self.local_obstacle_max_height <= self.local_obstacle_min_height:
+            raise ValueError('local obstacle max height must exceed min height')
         self.robot_xy = None
         self.elevation_tree = None
         self.elevation_points = None
@@ -56,18 +79,26 @@ class WaypointBridge(object):
         self.floor_z_ref = float(rospy.get_param('~floor_z_ref', 0.0))
         self.last_sent = None
         self.projected_map = None
+        self.projected_map_received = None
+        self.local_clearance_tree = None
+        self.local_clearance_received = None
+        self.local_clearance_points = 0
+        from scipy.spatial import cKDTree
+        self.local_clearance_tree_type = cKDTree
         self.paused = False
         # latch 不开：latch 会让迟连接的订阅者收到旧 Path 触发意外重规划
         self.path_pub = rospy.Publisher('/initial_path', Path, queue_size=1)
         self.valid_pub = rospy.Publisher('/ariadne/bridge/target_valid', Bool,
                                          queue_size=1, latch=True)
         self.diag_pub = rospy.Publisher('/ariadne/bridge/diagnostic', String, queue_size=10)
+        # 独立显示桥接器实际重选的目标：绿色球；不覆盖AR紫点或SCAN白点。
+        self.adjusted_goal_pub = rospy.Publisher(
+            '/ariadne/bridge/adjusted_goal', Marker, queue_size=1, latch=True)
         rospy.Subscriber(self.body_pose_topic, Odometry, self.odom_cb, queue_size=1)
         if self.use_elevation:
             import numpy as np
             from scipy.spatial import cKDTree
             from sensor_msgs import point_cloud2
-            from sensor_msgs.msg import PointCloud2
             self.elevation_np = np
             self.elevation_reader = point_cloud2
             self.elevation_tree_type = cKDTree
@@ -77,19 +108,50 @@ class WaypointBridge(object):
         rospy.Subscriber('/floor_context/z_ref', Float64, self.floor_z_cb, queue_size=1)
         rospy.Subscriber('/way_point', PointStamped, self.waypoint_cb, queue_size=1)
         rospy.Subscriber('/projected_map', OccupancyGrid, self.map_cb, queue_size=1)
+        rospy.Subscriber(self.local_clearance_topic, PointCloud2,
+                         self.local_clearance_cb, queue_size=1)
         rospy.Subscriber('/ariadne/lifecycle/pause', Bool, self.pause_cb, queue_size=1)
         rospy.Subscriber('/ariadne/lifecycle/reset_for_floor', Bool, self.reset_cb, queue_size=1)
         self.valid_pub.publish(Bool(False))
         rospy.loginfo('[ariadne_goal_bridge] floor_z_ref=%.3f elevation=%s repub=%.2fm '
-                      'target_2d_clearance>%.2fm target_distance>%.2fm search=%.2fm',
+                      'target_2d_clearance>%.2fm target_distance>%.2fm search=%.2fm '
+                      'local_clearance=%s age<=%.2fs range<=%.2fm',
                       self.floor_z_ref, self.use_elevation,
                       self.repub_dist,
                       self.target_min_clearance, self.target_min_robot_distance,
-                      self.target_search_radius)
+                      self.target_search_radius, self.local_clearance_topic,
+                      self.local_clearance_max_age,
+                      self.local_clearance_max_robot_distance)
 
     def publish_diag(self, event, **fields):
         fields['event'] = event
         self.diag_pub.publish(String(json.dumps(fields, ensure_ascii=False, sort_keys=True)))
+
+    def publish_adjusted_goal(self, requested, target):
+        marker = Marker()
+        marker.header.stamp = rospy.Time.now()
+        marker.header.frame_id = 'world'
+        marker.ns = 'ariadne_bridge_adjusted_goal'
+        marker.id = 0
+        # 没有改点时删除旧绿点；此时紫点本身就是实际目标。
+        if math.hypot(target[0] - requested[0], target[1] - requested[1]) <= 1e-3:
+            marker.action = Marker.DELETE
+            self.adjusted_goal_pub.publish(marker)
+            return
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = target[0]
+        marker.pose.position.y = target[1]
+        ground_z = self.ground_z_at(target[0], target[1])
+        marker.pose.position.z = self.floor_z_ref if ground_z is None else ground_z
+        marker.pose.orientation.w = 1.0
+        # RViz PointStamped的Radius=0.4m；球Marker直径因此设为0.8m。
+        marker.scale.x = marker.scale.y = marker.scale.z = 0.8
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+        self.adjusted_goal_pub.publish(marker)
 
     def odom_cb(self, msg):
         p = msg.pose.pose.position
@@ -123,6 +185,63 @@ class WaypointBridge(object):
 
     def map_cb(self, msg):
         self.projected_map = msg
+        self.projected_map_received = time.monotonic()
+
+    def local_clearance_cb(self, msg):
+        """Cache current SCAN obstacle XY in AR's obstacle-height band."""
+        import numpy as np
+        fields = {field.name: field for field in msg.fields}
+        if any(name not in fields or fields[name].datatype != PointField.FLOAT32
+               or fields[name].count != 1 for name in ('x', 'y', 'z')):
+            rospy.logwarn_throttle(
+                10.0, '[ariadne_goal_bridge] ignore local occupancy with invalid xyz fields')
+            return
+        count = int(msg.width) * int(msg.height)
+        if count <= 0:
+            self.local_clearance_tree = None
+            self.local_clearance_points = 0
+            self.local_clearance_received = time.monotonic()
+            return
+        if msg.point_step <= 0 or len(msg.data) < count * msg.point_step:
+            rospy.logwarn_throttle(
+                10.0, '[ariadne_goal_bridge] ignore truncated local occupancy cloud')
+            return
+        endian = '>' if msg.is_bigendian else '<'
+        dtype = np.dtype({
+            'names': ['x', 'y', 'z'],
+            'formats': [endian + 'f4'] * 3,
+            'offsets': [fields[name].offset for name in ('x', 'y', 'z')],
+            'itemsize': msg.point_step,
+        })
+        points = np.frombuffer(bytes(msg.data), dtype=dtype, count=count)
+        xyz = np.column_stack((points['x'], points['y'], points['z'])).astype(
+            np.float64, copy=False)
+        z_min = self.floor_z_ref + self.local_obstacle_min_height
+        z_max = self.floor_z_ref + self.local_obstacle_max_height
+        keep = np.isfinite(xyz).all(axis=1)
+        keep &= xyz[:, 2] >= z_min
+        keep &= xyz[:, 2] <= z_max
+        xy = xyz[keep, :2]
+        self.local_clearance_tree = (self.local_clearance_tree_type(xy)
+                                     if len(xy) else None)
+        self.local_clearance_points = len(xy)
+        self.local_clearance_received = time.monotonic()
+
+    def local_obstacle_clearance(self, x, y):
+        """Return (usable, clearance to occupied-voxel boundary)."""
+        if self.local_clearance_received is None or self.robot_xy is None:
+            return False, None
+        if time.monotonic() - self.local_clearance_received \
+                > self.local_clearance_max_age:
+            return False, None
+        if math.hypot(x - self.robot_xy[0], y - self.robot_xy[1]) \
+                > self.local_clearance_max_robot_distance:
+            return False, None
+        if self.local_clearance_tree is None:
+            return True, None
+        distance, _ = self.local_clearance_tree.query((x, y), k=1)
+        half_diagonal = self.local_clearance_voxel_size / math.sqrt(2.0)
+        return True, max(float(distance) - half_diagonal, 0.0)
 
     @staticmethod
     def map_cell(msg, x, y):
@@ -173,6 +292,7 @@ class WaypointBridge(object):
         return value, clearance
 
     def target_is_safe(self, msg, x, y):
+        """Require global known-free state and prefer fresh local clearance."""
         cell = self.map_cell(msg, x, y)
         if cell is None:
             return False
@@ -180,9 +300,21 @@ class WaypointBridge(object):
         value = int(msg.data[iy * msg.info.width + ix])
         if value < 0 or value >= 50:
             return False
+        local_usable, local_clearance = self.local_obstacle_clearance(x, y)
+        if local_usable:
+            return local_clearance is None \
+                or local_clearance > self.target_min_clearance + 1e-6
         clearance = self.obstacle_clearance(
             msg, x, y, self.target_min_clearance)
         return clearance is None or clearance > self.target_min_clearance + 1e-6
+
+    def clearance_diagnostic(self, x, y):
+        local_usable, local_clearance = self.local_obstacle_clearance(x, y)
+        if local_usable:
+            return 'scan_local', local_clearance
+        return 'projected_fallback', (self.obstacle_clearance(
+            self.projected_map, x, y, 0.75)
+            if self.projected_map is not None else None)
 
     def target_is_far_enough(self, x, y):
         if self.robot_xy is None:
@@ -213,8 +345,7 @@ class WaypointBridge(object):
                 if not self.target_is_far_enough(x, y):
                     continue
                 if self.target_is_safe(msg, x, y):
-                    clearance = self.obstacle_clearance(
-                        msg, x, y, self.target_min_clearance + msg.info.resolution)
+                    clearance_source, clearance = self.clearance_diagnostic(x, y)
                     candidates.append((distance,
                                        -(clearance if clearance is not None else 1e9),
                                        x, y))
@@ -244,12 +375,14 @@ class WaypointBridge(object):
             self.publish_diag('REJECT_UNSAFE', requested_x=requested[0],
                               requested_y=requested[1],
                               required_clearance=self.target_min_clearance,
-                              search_radius=self.target_search_radius)
+                              search_radius=self.target_search_radius,
+                              local_map_age=(None if self.local_clearance_received is None
+                                             else time.monotonic() - self.local_clearance_received),
+                              local_obstacle_points=self.local_clearance_points)
             rospy.logwarn_throttle(
                 1.0, '[ariadne_goal_bridge] reject unsafe target (%.2f, %.2f): '
-                'no known-free point with >%.2fm clearance within %.2fm',
-                requested[0], requested[1], self.target_min_clearance,
-                self.target_search_radius)
+                'the final AR point is not known-free with >%.2fm clearance',
+                requested[0], requested[1], self.target_min_clearance)
             return
         if self.last_sent is not None:
             d = ((wp[0] - self.last_sent[0]) ** 2 +
@@ -272,18 +405,22 @@ class WaypointBridge(object):
             path.poses.append(ps)
         self.path_pub.publish(path)
         self.last_sent = wp
+        self.publish_adjusted_goal(requested, wp)
         self.valid_pub.publish(Bool(True))
-        map_value, clearance_2d = self.projected_map_diagnostic(wp[0], wp[1])
+        map_value, _ = self.projected_map_diagnostic(wp[0], wp[1])
+        clearance_source, clearance_2d = self.clearance_diagnostic(wp[0], wp[1])
         self.publish_diag('FORWARDED', requested_x=requested[0], requested_y=requested[1],
                           target_x=wp[0], target_y=wp[1],
-                          clearance=clearance_2d, retry=0)
+                          clearance=clearance_2d,
+                          clearance_source=clearance_source, retry=0)
         rospy.loginfo(
             '[ariadne_goal_bridge] 转发航点 requested=(%.2f, %.2f) '
             'effective=(%.2f, %.2f) ground_z=%.3f '
-            'projected_occ=%s projected_clearance=%s',
+            'projected_occ=%s clearance_source=%s clearance=%s',
             requested[0], requested[1], wp[0], wp[1],
             self.ground_z_at(wp[0], wp[1]),
             'NA' if map_value is None else str(map_value),
+            clearance_source,
             'NA' if clearance_2d is None else '%.2f' % clearance_2d)
 
 
@@ -301,7 +438,6 @@ class FeedbackWaypointBridge(WaypointBridge):
         self.failed = []
         self.current = None
         self.command = (0.0, 0.0, 0.0)
-        self.gate = (0.0, '')
         self.odom_received = 0.0
         self.odom_stamp = None
         self.last_good = time.monotonic()
@@ -319,8 +455,6 @@ class FeedbackWaypointBridge(WaypointBridge):
         rospy.Subscriber('/scan/goal_feedback', GoalFeedback,
                          lambda m: self.events.append(('feedback', m)), queue_size=20)
         rospy.Subscriber('/cmd_vel', Twist, self.command_cb, queue_size=10)
-        rospy.Subscriber('/cmd_vel_gate/status', String,
-                         lambda m: setattr(self, 'gate', (time.monotonic(), m.data)), queue_size=2)
         rospy.Timer(rospy.Duration(0.1), self.tick)
         rospy.Timer(rospy.Duration(30), lambda _: self.summary())
         rospy.on_shutdown(self.summary)
@@ -369,6 +503,15 @@ class FeedbackWaypointBridge(WaypointBridge):
         from scipy.ndimage import label
         msg = self.projected_map
         if msg is None or self.robot_xy is None or msg.info.resolution <= 0: return None
+        requested = (self.decision.point.x, self.decision.point.y)
+        # Preserve a valid AR waypoint, including historical-return legs across
+        # stale global-map components. SCAN owns current route feasibility.
+        # Failed requests still go through the existing replacement search.
+        if self.target_is_far_enough(*requested) \
+                and all(math.hypot(requested[0]-x, requested[1]-y) >= 0.6
+                        for x, y in self.failed) \
+                and self.target_is_safe(msg, *requested):
+            return requested
         grid = np.asarray(msg.data).reshape(msg.info.height, msg.info.width)
         cell = self.map_cell(msg, *self.robot_xy)
         if cell is None: return None
@@ -378,16 +521,16 @@ class FeedbackWaypointBridge(WaypointBridge):
         ys, xs = np.nonzero(regions == region)
         x = msg.info.origin.position.x + (xs + .5) * msg.info.resolution
         y = msg.info.origin.position.y + (ys + .5) * msg.info.resolution
-        requested = (self.decision.point.x, self.decision.point.y)
         distances = np.hypot(x - requested[0], y - requested[1])
         keep = distances <= self.target_search_radius
         keep &= np.hypot(x-self.robot_xy[0], y-self.robot_xy[1]) \
             > self.target_min_robot_distance
-        for fx, fy in self.failed: keep &= np.hypot(x-fx, y-fy) >= 0.6
+        for fx, fy in self.failed:
+            keep &= np.hypot(x-fx, y-fy) >= 0.6
         indices = np.flatnonzero(keep)
         for i in indices[np.argsort(distances[indices])]:
             candidate = (float(x[i]), float(y[i]))
-            if self.target_is_safe(msg, *candidate) and self.target_is_safe(self.projected_map, *candidate):
+            if self.target_is_safe(msg, *candidate):
                 return candidate
         return None
 
@@ -398,7 +541,10 @@ class FeedbackWaypointBridge(WaypointBridge):
         target = self.choose()
         if target is None:
             self.publish_diag('NO_CANDIDATE', requested_x=self.decision.point.x,
-                              requested_y=self.decision.point.y, failed=len(self.failed))
+                              requested_y=self.decision.point.y, failed=len(self.failed),
+                              local_map_age=(None if self.local_clearance_received is None
+                                             else time.monotonic() - self.local_clearance_received),
+                              local_obstacle_points=self.local_clearance_points)
             self.cancel()
             self.counts['exhausted'] += 1
             rospy.logwarn('[AR_RECOVERY] exhausted attempts=%d counts=%s', len(self.failed), self.counts)
@@ -424,11 +570,15 @@ class FeedbackWaypointBridge(WaypointBridge):
         self.valid_intervals.clear()
         if self.failed: self.counts['retry_sent'] += 1
         self.path_pub.publish(path)
+        self.publish_adjusted_goal(
+            (self.decision.point.x, self.decision.point.y), target)
         self.valid_pub.publish(Bool(True))
-        map_value, clearance_2d = self.projected_map_diagnostic(target[0], target[1])
+        map_value, _ = self.projected_map_diagnostic(target[0], target[1])
+        clearance_source, clearance_2d = self.clearance_diagnostic(target[0], target[1])
         self.publish_diag('FORWARDED', requested_x=self.decision.point.x,
                           requested_y=self.decision.point.y, target_x=target[0],
                           target_y=target[1], clearance=clearance_2d,
+                          clearance_source=clearance_source,
                           retry=len(self.failed))
         rospy.loginfo('[AR_RECOVERY] goal_sent decision=%s attempt=%s target=%s retries=%d counts=%s',
                       self.decision.header.stamp, path.header.stamp, target, len(self.failed), self.counts)
@@ -466,19 +616,18 @@ class FeedbackWaypointBridge(WaypointBridge):
             self.last_good = now
             return
         if self.pending_retry:
-            if self.motion and self.failed and (now-self.gate[0] > .5 or self.gate[1] not in ('READY', 'WAIT_TRAJECTORY') or now-self.odom_received > .5):
-                rospy.logwarn_throttle(5, '[AR_RECOVERY] retry pending: existing gate not ready')
+            if self.motion and self.failed and now-self.odom_received > .5:
+                rospy.logwarn_throttle(5, '[AR_RECOVERY] retry pending: odometry not ready')
                 return
             if self.projected_map is not None and self.robot_xy is not None:
                 self.send_attempt()
             return
         if not self.motion or self.attempt is None: return
         ct, v, w = self.command
-        gt, state = self.gate
-        if now-self.odom_received > .5 or now-gt > .5 or state != 'READY' or now-ct > .25:
+        if now-self.odom_received > .5:
             self.last_good = now
             self.valid_intervals.clear()
-            rospy.logwarn_throttle(5, '[AR_RECOVERY] suspended: gate/odom/command not ready (%s)', state)
+            rospy.logwarn_throttle(5, '[AR_RECOVERY] suspended: odometry not ready')
             return
         if v > .03 or w > .05: self.valid_intervals.append((now, dt, ct))
         while self.valid_intervals and now-self.valid_intervals[0][0] > 1.0:

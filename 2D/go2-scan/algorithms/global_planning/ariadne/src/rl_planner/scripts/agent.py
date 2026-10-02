@@ -238,9 +238,16 @@ class Agent:
 
     def select_next_waypoint(self, observation, greedy=True, excluded_positions=None,
                              position_penalty=None):
-        _, _, _, _, current_edge, _ = observation
+        _, _, _, current_index, current_edge, action_mask = observation
         with torch.no_grad():
             logp = self.policy_net(*observation)
+
+        # All masked logits normalize to finite probabilities. The original
+        # mask, not log-probability magnitude, defines executable actions.
+        allowed = (action_mask.reshape_as(logp) == 0)
+        allowed &= current_edge[..., 0] != current_index.reshape(-1, 1)
+        logp = logp.clone()
+        logp[~allowed] = -float('inf')
 
         if excluded_positions:
             excluded_positions = set(excluded_positions)

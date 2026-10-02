@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build every component used by the real FAST-LIO + SCAN + AR stack.
+# Build every component used by the real FAST-LIO + SCAN + TARE/AR stack.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,9 +34,16 @@ if [ ! -e "$SCAN/src/CMakeLists.txt" ]; then
 fi
 (cd "$SCAN" && catkin_make -DCMAKE_BUILD_TYPE=Release -j2)
 
+# TARE and the two CMU terrain-analysis packages use the bundled ARM64 OR-Tools.
+TARE="$ROOT/2D/go2-scan/algorithms/global_planning/tare_planner"
+if [ ! -e "$TARE/src/CMakeLists.txt" ]; then
+  ln -s /opt/ros/noetic/share/catkin/cmake/toplevel.cmake "$TARE/src/CMakeLists.txt"
+fi
+(cd "$TARE" && catkin_make -DCMAKE_BUILD_TYPE=Release -j2)
+
 cmake -S "$ROOT/2D/go2-scan/integration/go2_motion" \
   -B "$ROOT/2D/go2-scan/integration/go2_motion/build" \
   -DUNITREE_SDK_ROOT="$ROOT/third_party/unitree_sdk2" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$ROOT/2D/go2-scan/integration/go2_motion/build" -- -j2
 
-echo '[BUILD] FAST-LIO, Livox driver, sensor scan, optional elevation mapping, SCAN and Go2 motion bridge built successfully'
+echo '[BUILD] FAST-LIO, Livox driver, sensor scan, optional elevation mapping, SCAN, TARE/terrain analysis and Go2 motion bridge built successfully'
